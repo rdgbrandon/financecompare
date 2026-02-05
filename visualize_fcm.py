@@ -1,16 +1,26 @@
+# visualize_fcm.py
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
-import yfinance as yf  # ADD THIS: pip install yfinance if needed
+import yfinance as yf  # pip install yfinance
 import pandas as pd
 from datetime import datetime, timedelta
+import copy
+from matplotlib.animation import FuncAnimation
 
-fig, ax = plt.subplots(figsize=(20, 14))
-ax.set_xlim(0, 20)
-ax.set_ylim(0, 14)
-ax.set_aspect('equal')
-ax.axis('off')
+# -------------------------
+# --- Canvas & axes setup
+# -------------------------
+fig, (ax_static, ax_dyn) = plt.subplots(1, 2, figsize=(36, 14))
+for ax in (ax_static, ax_dyn):
+    ax.set_xlim(0, 20)
+    ax.set_ylim(0, 14)
+    ax.set_aspect('equal')
+    ax.axis('off')
 
+# -------------------------
+# --- Nodes + layout (unchanged)
+# -------------------------
 outer_nodes = [
     ('Large_Deficits', '^IRX', '13W Treasury Bill', 1.5, 12),
     ('Foreign_Demand', 'UUP', 'US Dollar Index', 1.5, 10),
@@ -32,6 +42,12 @@ inner_nodes = [
     ('NASDAQ', 15, 8.5),
 ]
 
+# canonical node order (outer -> inner -> target)
+node_order = [n[0] for n in outer_nodes] + [n[0] for n in inner_nodes]
+
+# -------------------------
+# --- Drawing helper funcs (unchanged visuals)
+# -------------------------
 def draw_outer_node(ax, name, ticker, desc, x, y):
     box = mpatches.FancyBboxPatch((x-1.4, y-0.6), 2.8, 1.2,
                                    boxstyle="round,pad=0.05",
@@ -50,14 +66,40 @@ def draw_target_node(ax, name, x, y):
     ax.add_patch(circle)
     ax.text(x, y, name, ha='center', va='center', fontsize=12, fontweight='bold')
 
-for name, ticker, desc, x, y in outer_nodes:
-    draw_outer_node(ax, name, ticker, desc, x, y)
+# draw base layout onto a given axis (nodes + legends + proxy text)
+def draw_base_layout(ax, show_legend=True):
+    for name, ticker, desc, x, y in outer_nodes:
+        draw_outer_node(ax, name, ticker, desc, x, y)
+    for name, x, y in inner_nodes[:-1]:
+        draw_inner_node(ax, name, x, y)
+    draw_target_node(ax, 'NASDAQ', 15, 8.5)
+    if show_legend:
+        legend_elements = [
+            mpatches.Patch(facecolor='lightblue', edgecolor='black', label='Outer Nodes (Yahoo Finance proxies)'),
+            mpatches.Patch(facecolor='lightyellow', edgecolor='black', label='Inner Nodes (computed)'),
+            mpatches.Patch(facecolor='lightgreen', edgecolor='darkgreen', label='Target Node (NASDAQ)'),
+            plt.Line2D([0], [0], color='green', linewidth=3, label='Positive weight'),
+            plt.Line2D([0], [0], color='red', linewidth=3, label='Negative weight'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+    ax.text(10, 13.5, 'FCM Node Structure & Proxy Assignments', ha='center', fontsize=16, fontweight='bold')
+    ax.text(10, 13, 'Blue boxes = Input nodes with Yahoo Finance ticker proxies', ha='center', fontsize=10)
+    proxy_text = """
+PROXY ISSUES:
+• XLI used for BOTH Supply_Increase AND Business_Investment
+• Most proxies are stock prices, not economic indicators
+• Low_Unemployment has NO proxy (defaults to 0.5)
+• All data is same-day (no prediction lag)
+"""
+    ax.text(0.5, 2.5, proxy_text, fontsize=9, va='top',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
 
-for name, x, y in inner_nodes[:-1]:
-    draw_inner_node(ax, name, x, y)
+# draw base layout on static side
+draw_base_layout(ax_static, show_legend=True)
 
-draw_target_node(ax, 'NASDAQ', 15, 8.5)
-
+# -------------------------
+# --- Connections (same as your code)
+# -------------------------
 connections = [
     # To Monetary Policy (green = positive)
     (1.5, 12, 8, 10, 0.7, 'green'),      # Large_Deficits
@@ -91,83 +133,57 @@ connections = [
     (18, 4, 15, 8.5, 0.7, 'green'),      # AI_Technology
 ]
 
-for x1, y1, x2, y2, weight, color in connections:
-    dx, dy = x2 - x1, y2 - y1
-    dist = np.sqrt(dx**2 + dy**2)
-
-    offset1 = 1.0 if x1 < 5 else 0.9
-    offset2 = 1.1 if (x2, y2) == (15, 8.5) else 0.9
-
-    start_x = x1 + (dx/dist) * offset1
-    start_y = y1 + (dy/dist) * offset1
-    end_x = x2 - (dx/dist) * offset2
-    end_y = y2 - (dy/dist) * offset2
-
-    ax.annotate('', xy=(end_x, end_y), xytext=(start_x, start_y),
-                arrowprops=dict(arrowstyle='->', color=color, lw=abs(weight)*2.5, alpha=0.7))
-
-    mid_x, mid_y = (start_x + end_x) / 2, (start_y + end_y) / 2
-    ax.text(mid_x, mid_y, f'{weight}', fontsize=7, ha='center', va='center',
-            bbox=dict(boxstyle='round', facecolor='white', edgecolor=color, alpha=0.8))
-
-legend_elements = [
-    mpatches.Patch(facecolor='lightblue', edgecolor='black', label='Outer Nodes (Yahoo Finance proxies)'),
-    mpatches.Patch(facecolor='lightyellow', edgecolor='black', label='Inner Nodes (computed)'),
-    mpatches.Patch(facecolor='lightgreen', edgecolor='darkgreen', label='Target Node (NASDAQ)'),
-    plt.Line2D([0], [0], color='green', linewidth=3, label='Positive weight'),
-    plt.Line2D([0], [0], color='red', linewidth=3, label='Negative weight'),
-]
-ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
-
-ax.text(10, 13.5, 'FCM Node Structure & Proxy Assignments', ha='center', fontsize=16, fontweight='bold')
-ax.text(10, 13, 'Blue boxes = Input nodes with Yahoo Finance ticker proxies', ha='center', fontsize=10)
-
-proxy_text = """
-PROXY ISSUES:
-• XLI used for BOTH Supply_Increase AND Business_Investment
-• Most proxies are stock prices, not economic indicators
-• Low_Unemployment has NO proxy (defaults to 0.5)
-• All data is same-day (no prediction lag)
-"""
-ax.text(0.5, 2.5, proxy_text, fontsize=9, va='top',
-        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
-
-plt.tight_layout()
-plt.savefig('fcm_structure.png', dpi=150, bbox_inches='tight', facecolor='white')
-plt.show()
-print("Saved to fcm_structure.png")
-
-# ──────────────────────────────────────────────────────────────
-# NEW: FCM Computation & Accuracy Validation (keeps your structure/weights intact)
-# ──────────────────────────────────────────────────────────────
-
-# Map positions to names (used to build weight dict from connections)
+# Build pos->name mapping for convenience
 pos_to_name = {}
 for name, _, _, x, y in outer_nodes:
     pos_to_name[(x, y)] = name
 for name, x, y in inner_nodes:
     pos_to_name[(x, y)] = name
 
-# Build signed weights dict: source_name -> target_name -> weight
-weights_dict = {}
+# Build static weights dict (from connections)
+weights_static_from_connections = {}
 for x1, y1, x2, y2, weight, _ in connections:
     src = pos_to_name.get((x1, y1))
     tgt = pos_to_name.get((x2, y2))
     if src and tgt:
-        weights_dict.setdefault(src, {})[tgt] = weight
+        weights_static_from_connections.setdefault(src, {})[tgt] = weight
 
-# Topological order (inputs → inners → target)
-node_order = [
-    'Large_Deficits', 'Foreign_Demand', 'Low_Unemployment', 'Supply_Increase',
-    'Energy_Price_Increase', 'Consumer_Demand', 'Business_Investment',
-    'Market_Volatility', 'Equity_Inflows', 'AI_Technology',
-    'Monetary_Policy', 'Inflation', 'Corporate_Earnings',
-    'Investor_Sentiment', 'NASDAQ'
-]
+# Draw arrows on static axis using original connection weights (exact parity)
+def draw_arrows_on_axis(ax, weights_dict_local, annotate_weights=True):
+    for x1, y1, x2, y2, weight_orig, _ in connections:
+        dx, dy = x2 - x1, y2 - y1
+        dist = np.sqrt(dx**2 + dy**2)
+        offset1 = 1.0 if x1 < 5 else 0.9
+        offset2 = 1.1 if (x2, y2) == (15, 8.5) else 0.9
+        start_x = x1 + (dx/dist) * offset1
+        start_y = y1 + (dy/dist) * offset1
+        end_x = x2 - (dx/dist) * offset2
+        end_y = y2 - (dy/dist) * offset2
 
-# Fetch historical data (adjust days as needed; e.g., 5 years)
+        src = pos_to_name.get((x1, y1))
+        tgt = pos_to_name.get((x2, y2))
+        w = weight_orig
+        if src and tgt:
+            w = weights_dict_local.get(src, {}).get(tgt, weight_orig)
+
+        color = 'green' if w >= 0 else 'red'
+        ax.annotate('', xy=(end_x, end_y), xytext=(start_x, start_y),
+                    arrowprops=dict(arrowstyle='->', color=color, lw=max(0.5, abs(w)*3.0), alpha=0.8))
+        if annotate_weights:
+            mid_x, mid_y = (start_x + end_x) / 2, (start_y + end_y) / 2
+            ax.text(mid_x, mid_y, f'{w:.2f}', fontsize=7, ha='center', va='center',
+                    bbox=dict(boxstyle='round', facecolor='white', edgecolor=color, alpha=0.8))
+
+draw_arrows_on_axis(ax_static, weights_static_from_connections, annotate_weights=True)
+
+plt.savefig('fcm_structure.png', dpi=150, bbox_inches='tight', facecolor='white')
+print("Saved static diagram to fcm_structure.png")
+
+# -------------------------
+# --- Data fetching (robust)
+# -------------------------
 end_date = datetime.now().strftime('%Y-%m-%d')
-start_date = (datetime.now() - timedelta(days=5*365 + 100)).strftime('%Y-%m-%d')  # extra buffer
+start_date = (datetime.now() - timedelta(days=5*365 + 100)).strftime('%Y-%m-%d')
 
 tickers = {
     'Large_Deficits': '^IRX',
@@ -179,89 +195,288 @@ tickers = {
     'Market_Volatility': '^VIX',
     'Equity_Inflows': 'SPY',
     'AI_Technology': 'NVDA',
-    'NASDAQ': '^IXIC'  # real target for validation
+    'NASDAQ': '^IXIC'  # real target
 }
 
 print("Fetching data...")
-data = yf.download(list(set(tickers.values())), start=start_date, end=end_date, progress=False)['Adj Close']
-data = data.ffill().dropna(how='all')  # basic cleaning
+tickers_list = list(set(tickers.values()))
+try:
+    raw_all = yf.download(tickers_list, start=start_date, end=end_date, auto_adjust=True, progress=False)
+except Exception as e:
+    print("yfinance download error:", e)
+    raw_all = pd.DataFrame(index=pd.date_range(start=start_date, end=end_date))
 
-# Transform to stationary proxies
-returns = data.pct_change().fillna(0)
+# Normalize download result to a single-level series of prices
+# If yfinance returned a DataFrame with MultiIndex columns choose 'Close' or auto_adjust ensured Close exists
+if isinstance(raw_all.columns, pd.MultiIndex):
+    # prefer 'Close' if available in top-level, else try to collapse second level
+    if 'Close' in raw_all.columns.levels[0]:
+        raw = raw_all['Close']
+    else:
+        # Collapse by taking top-level first available price column
+        raw = raw_all.xs(raw_all.columns.levels[0][0], axis=1, level=0, drop_level=True)
+elif 'Close' in raw_all.columns:
+    raw = raw_all['Close']
+elif 'Adj Close' in raw_all.columns:
+    raw = raw_all['Adj Close']
+else:
+    # fallback: if raw_all itself is single column series or similar, try to use it
+    raw = raw_all.copy()
 
-inputs = pd.DataFrame(index=data.index, columns=node_order[:10])
-inputs['Large_Deficits'] = data['^IRX'] / 100.0          # yield level ~0-0.1
-inputs['Foreign_Demand'] = returns['UUP']
-inputs['Low_Unemployment'] = 0.5                         # fixed as per your code
-inputs['Supply_Increase'] = returns['XLI']
-inputs['Energy_Price_Increase'] = returns['XLE']
-inputs['Consumer_Demand'] = returns['XLY']
-inputs['Business_Investment'] = returns['XLI']           # duplicate as-is
-inputs['Market_Volatility'] = data['^VIX'] / 50.0        # rough scale (VIX ~10-50)
-inputs['Equity_Inflows'] = returns['SPY']
-inputs['AI_Technology'] = returns['NVDA']
+# ensure all tickers exist as columns
+for t in tickers_list:
+    if t not in raw.columns:
+        raw[t] = np.nan
+
+raw = raw.sort_index().ffill().bfill()
+
+# compute returns; use fill_method=None to avoid FutureWarning
+returns = raw.pct_change(fill_method=None).fillna(0)
+
+# Build input proxies (safe)
+inputs = pd.DataFrame(index=raw.index, columns=[n for n in node_order[:10]], dtype=float)
+
+def safe_series(sym, default=0.5):
+    if sym in raw.columns:
+        return raw[sym].copy()
+    else:
+        print(f"Warning: ticker {sym} missing — using constant proxy {default}")
+        return pd.Series(default, index=raw.index)
+
+def safe_return(sym):
+    if sym in returns.columns:
+        return returns[sym].copy()
+    else:
+        print(f"Warning: returns for {sym} missing — using 0.0")
+        return pd.Series(0.0, index=returns.index)
+
+inputs['Large_Deficits'] = safe_series('^IRX') / 100.0
+inputs['Foreign_Demand'] = safe_return('UUP')
+inputs['Low_Unemployment'] = 0.5
+inputs['Supply_Increase'] = safe_return('XLI')
+inputs['Energy_Price_Increase'] = safe_return('XLE')
+inputs['Consumer_Demand'] = safe_return('XLY')
+inputs['Business_Investment'] = safe_return('XLI')
+inputs['Market_Volatility'] = safe_series('^VIX') / 50.0
+inputs['Equity_Inflows'] = safe_return('SPY')
+inputs['AI_Technology'] = safe_return('NVDA')
 
 # Normalize to [0,1]
 inputs_norm = (inputs - inputs.min()) / (inputs.max() - inputs.min() + 1e-8)
-inputs_norm = inputs_norm.clip(0, 1)
+inputs_norm = inputs_norm.clip(0, 1).fillna(0.5)
 
-# Sigmoid activation (tunable steepness)
-def sigmoid(x, c=2.0):  # try c=1.0, 2.0, 3.0, 5.0 to tune accuracy
-    return 1 / (1 + np.exp(-c * x))
+# Actual NASDAQ returns & normalized actual used as target
+actual_returns = returns['^IXIC'] if '^IXIC' in returns.columns else pd.Series(0.0, index=returns.index)
+actual_norm = (actual_returns - actual_returns.min()) / (actual_returns.max() - actual_returns.min() + 1e-8)
 
-# Compute activations with 1-day lag (t-1 inputs → t prediction)
-activations = pd.DataFrame(index=data.index, columns=node_order, dtype=float)
-activations.update(inputs_norm)  # outer nodes
+# -------------------------
+# --- Weights dict from connections (static baseline)
+# -------------------------
+weights_dict = {}
+for x1, y1, x2, y2, weight, _ in connections:
+    src = pos_to_name.get((x1, y1))
+    tgt = pos_to_name.get((x2, y2))
+    if src and tgt:
+        weights_dict.setdefault(src, {})[tgt] = weight
 
-print("Computing activations...")
-for i in range(1, len(activations)):  # start from 1 for lag
-    date = activations.index[i]
-    prev_date = activations.index[i-1]
-    prev_act = activations.loc[prev_date].copy()
-    
-    # Compute each inner/target node
-    prev_act['Monetary_Policy'] = sigmoid(sum(weights_dict.get(src, {}).get('Monetary_Policy', 0) * prev_act[src]
-                                               for src in node_order), c=2.0)
-    
-    prev_act['Inflation'] = sigmoid(sum(weights_dict.get(src, {}).get('Inflation', 0) * prev_act[src]
-                                        for src in node_order), c=2.0)
-    
-    prev_act['Corporate_Earnings'] = sigmoid(sum(weights_dict.get(src, {}).get('Corporate_Earnings', 0) * prev_act[src]
-                                                 for src in node_order), c=2.0)
-    
-    prev_act['Investor_Sentiment'] = sigmoid(sum(weights_dict.get(src, {}).get('Investor_Sentiment', 0) * prev_act[src]
-                                                 for src in node_order), c=2.0)
-    
-    prev_act['NASDAQ'] = sigmoid(sum(weights_dict.get(src, {}).get('NASDAQ', 0) * prev_act[src]
-                                     for src in node_order), c=2.0)
-    
-    activations.loc[date] = prev_act
+# -------------------------
+# --- Numeric helpers
+# -------------------------
+def sigmoid(x, c=2.0):
+    x = np.clip(np.asarray(x, dtype=float), -50, 50)
+    return 1.0 / (1.0 + np.exp(-c * x))
 
-# Shift for prediction alignment: computed NASDAQ is now prediction for current day
+def compute_state_from_outer(outer_series, wdict, node_order_local, max_iter=60, tol=1e-5):
+    # outer_series: pandas Series of the outer nodes (10)
+    state = {n: 0.5 for n in node_order_local}
+    for k in outer_series.index:
+        state[k] = float(outer_series[k])
+    inner_idx = ['Monetary_Policy', 'Inflation', 'Corporate_Earnings', 'Investor_Sentiment', 'NASDAQ']
+    for _ in range(max_iter):
+        prev_state = state.copy()
+        for tgt in inner_idx:
+            s = 0.0
+            for src in node_order_local:
+                s += wdict.get(src, {}).get(tgt, 0.0) * state[src]
+            state[tgt] = float(sigmoid(s, c=2.0))
+        if max(abs(prev_state[n] - state[n]) for n in inner_idx) < tol:
+            break
+    return state
+
+# -------------------------
+# --- Static activations (exact parity)
+# -------------------------
+activations = pd.DataFrame(index=inputs_norm.index, columns=node_order, dtype=float)
+activations.update(inputs_norm)
+
+print("Computing static activations...")
+for i in range(1, len(activations)):
+    prev_outer = inputs_norm.iloc[i-1]
+    state = compute_state_from_outer(prev_outer, weights_dict, node_order)
+    activations.loc[activations.index[i]] = pd.Series(state)
+
 activations['NASDAQ_pred'] = activations['NASDAQ']
+valid_idx = activations.index[1:]
+static_pred = activations['NASDAQ_pred'].loc[valid_idx]
+static_pred_norm = (static_pred - static_pred.min()) / (static_pred.max() - static_pred.min() + 1e-8)
 
-# Actual NASDAQ returns (for comparison)
-actual_returns = returns['^IXIC'].reindex(activations.index).fillna(0)
+static_corr = static_pred_norm.corr(actual_norm.loc[valid_idx])
+static_mse = ((static_pred_norm - actual_norm.loc[valid_idx]) ** 2).mean()
+print(f"\nStatic FCM metrics (lagged): corr={static_corr:.4f}, normalized MSE={static_mse:.6f}")
 
-# Metrics (alignment after lag)
-valid_idx = activations.index[1:]  # drop first row (no prev)
-pred = activations['NASDAQ_pred'].loc[valid_idx]
-actual = actual_returns.loc[valid_idx]
+# -------------------------
+# --- Dynamic FCM (online updates)
+# -------------------------
+dynamic_weights = copy.deepcopy(weights_dict)
+learning_rate = 0.02
+weight_clip = 3.0
 
-correlation = pred.corr(actual)
-mse = ((pred - (actual - actual.min()) / (actual.max() - actual.min() + 1e-8)) ** 2).mean()  # normalized MSE
+dates = list(inputs_norm.index)
+n_steps = len(dates)
+max_frames = min(200, n_steps)
+skip = max(1, n_steps // max_frames)
 
-print(f"\nModel Accuracy Metrics (lagged prediction):")
-print(f"Correlation with actual NASDAQ daily returns: {correlation:.4f}")
-print(f"Normalized MSE: {mse:.6f}")
-print(f"Sigmoid steepness used (c): 2.0 — try changing to 1.0, 3.0, etc. to improve")
-print("Higher correlation / lower MSE = better accuracy. Expect 0.2–0.5+ correlation depending on period.")
+weights_history = []
+pred_history = []
+date_history = []
 
-# Optional: Plot comparison
-fig2, ax2 = plt.subplots(figsize=(12, 6))
-ax2.plot(activations.index, activations['NASDAQ_pred'], label='FCM NASDAQ Prediction (lagged)')
-norm_actual = (actual_returns - actual_returns.min()) / (actual_returns.max() - actual_returns.min() + 1e-8)
-ax2.plot(actual_returns.index, norm_actual, label='Normalized Actual NASDAQ Returns', alpha=0.7)
-ax2.legend()
-ax2.set_title('FCM Prediction vs Actual NASDAQ Returns')
+print("Running online updates to build dynamic weight history...")
+for idx in range(1, n_steps):
+    date = dates[idx]
+    prev_date = dates[idx-1]
+    outer_prev = inputs_norm.loc[prev_date]
+
+    # compute state using current dynamic_weights (so updates affect future)
+    state = compute_state_from_outer(outer_prev, dynamic_weights, node_order)
+    pred = state['NASDAQ']
+
+    # target using normalized actual at current date (if exists)
+    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
+
+    error = target - pred
+    grad = pred * (1 - pred)
+    delta = error * grad
+
+    # update incoming NASDAQ weights only
+    for src in node_order:
+        if src in dynamic_weights and 'NASDAQ' in dynamic_weights[src]:
+            dynamic_weights[src]['NASDAQ'] += learning_rate * delta * state[src]
+            dynamic_weights[src]['NASDAQ'] = np.clip(dynamic_weights[src]['NASDAQ'], -weight_clip, weight_clip)
+
+    # snapshot
+    if (idx % skip) == 0 or idx == n_steps - 1:
+        weights_history.append(copy.deepcopy(dynamic_weights))
+        pred_history.append(pred)
+        date_history.append(date)
+
+# replay dynamic to produce dyn_series aligned for metrics
+dynamic_weights_replay = copy.deepcopy(weights_dict)
+dyn_series = pd.Series(index=inputs_norm.index, dtype=float)
+for idx in range(1, n_steps):
+    date = dates[idx]
+    prev_date = dates[idx-1]
+    state = compute_state_from_outer(inputs_norm.loc[prev_date], dynamic_weights_replay, node_order)
+    dyn_series.loc[date] = state['NASDAQ']
+    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
+    error = target - state['NASDAQ']
+    grad = state['NASDAQ'] * (1 - state['NASDAQ'])
+    delta = error * grad
+    for src in node_order:
+        if src in dynamic_weights_replay and 'NASDAQ' in dynamic_weights_replay[src]:
+            dynamic_weights_replay[src]['NASDAQ'] += learning_rate * delta * state[src]
+            dynamic_weights_replay[src]['NASDAQ'] = np.clip(dynamic_weights_replay[src]['NASDAQ'], -weight_clip, weight_clip)
+
+dyn_norm = (dyn_series - dyn_series.min()) / (dyn_series.max() - dyn_series.min() + 1e-8)
+valid_idx_dyn = dyn_norm.dropna().index.intersection(valid_idx)
+dynamic_corr = dyn_norm.loc[valid_idx_dyn].corr(actual_norm.loc[valid_idx_dyn])
+dynamic_mse = ((dyn_norm.loc[valid_idx_dyn] - actual_norm.loc[valid_idx_dyn]) ** 2).mean()
+print(f"Dynamic FCM metrics (lagged): corr={dynamic_corr:.4f}, normalized MSE={dynamic_mse:.6f}")
+
+# -------------------------
+# --- Prepare dynamic panel drawing utilities
+# -------------------------
+def draw_nodes_on_axis(ax):
+    for name, ticker, desc, x, y in outer_nodes:
+        box = mpatches.FancyBboxPatch((x-1.4, y-0.6), 2.8, 1.2,
+                                       boxstyle="round,pad=0.05",
+                                       facecolor='lightblue', edgecolor='black', linewidth=2)
+        ax.add_patch(box)
+        ax.text(x, y+0.2, name.replace('_', '\n'), ha='center', va='center', fontsize=8, fontweight='bold')
+        ax.text(x, y-0.35, f'{ticker}', ha='center', va='center', fontsize=7, color='darkblue')
+    for name, x, y in inner_nodes[:-1]:
+        circle = plt.Circle((x, y), 0.9, facecolor='lightyellow', edgecolor='black', linewidth=2)
+        ax.add_patch(circle)
+        ax.text(x, y, name.replace('_', '\n'), ha='center', va='center', fontsize=8, fontweight='bold')
+    circle = plt.Circle((15, 8.5), 1.1, facecolor='lightgreen', edgecolor='darkgreen', linewidth=3)
+    ax.add_patch(circle)
+    ax.text(15, 8.5, 'NASDAQ', ha='center', va='center', fontsize=12, fontweight='bold')
+
+def draw_arrows_dynamic(ax, wdict, annotate_weights=True):
+    # clear and redraw nodes
+    ax.cla()
+    ax.set_xlim(0, 20)
+    ax.set_ylim(0, 14)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    draw_nodes_on_axis(ax)
+    for x1, y1, x2, y2, orig_w, _ in connections:
+        dx, dy = x2 - x1, y2 - y1
+        dist = np.sqrt(dx**2 + dy**2)
+        offset1 = 1.0 if x1 < 5 else 0.9
+        offset2 = 1.1 if (x2, y2) == (15, 8.5) else 0.9
+        start_x = x1 + (dx/dist) * offset1
+        start_y = y1 + (dy/dist) * offset1
+        end_x = x2 - (dx/dist) * offset2
+        end_y = y2 - (dy/dist) * offset2
+
+        src = pos_to_name.get((x1, y1))
+        tgt = pos_to_name.get((x2, y2))
+        w = orig_w
+        if src and tgt:
+            w = wdict.get(src, {}).get(tgt, orig_w)
+
+        color = 'green' if w >= 0 else 'red'
+        ax.annotate('', xy=(end_x, end_y), xytext=(start_x, start_y),
+                    arrowprops=dict(arrowstyle='->', color=color, lw=max(0.5, abs(w)*3.0), alpha=0.85))
+        if annotate_weights:
+            mid_x, mid_y = (start_x + end_x) / 2, (start_y + end_y) / 2
+            ax.text(mid_x, mid_y, f'{w:.2f}', fontsize=8, ha='center', va='center',
+                    bbox=dict(boxstyle='round', facecolor='white', edgecolor=color, alpha=0.9))
+    return ax
+
+# initialize dynamic panel with first snapshot (or baseline)
+initial_weights = weights_history[0] if weights_history else weights_dict
+draw_arrows_dynamic(ax_dyn, initial_weights)
+ax_dyn.text(10, 13.2, 'Dynamic FCM (weights update over time)', ha='center', fontsize=12, fontweight='bold')
+
+# -------------------------
+# --- Animation update function
+# -------------------------
+def update_frame(idx):
+    wdict = weights_history[idx]
+    date = date_history[idx] if idx < len(date_history) else None
+    draw_arrows_dynamic(ax_dyn, wdict, annotate_weights=True)
+    txt = f"Dynamic weights snapshot\nDate: {date.strftime('%Y-%m-%d') if date is not None else 'N/A'}"
+    ax_dyn.text(10, 13.2, txt, ha='center', fontsize=12, fontweight='bold')
+
+frames = len(weights_history)
+if frames == 0:
+    print("No dynamic weight history produced; skipping animation.")
+else:
+    ani = FuncAnimation(fig, update_frame, frames=frames, interval=300, repeat=False)
+
+# -------------------------
+# --- Final console outputs + show
+# -------------------------
+print("\nFINAL METRICS:")
+print(f"Static FCM corr: {static_corr:.4f}, static MSE: {static_mse:.6f}")
+print(f"Dynamic FCM corr: {dynamic_corr:.4f}, dynamic MSE: {dynamic_mse:.6f}")
+
+final_w = weights_history[-1] if weights_history else weights_dict
+print("\nFinal incoming NASDAQ weights (dynamic snapshot):")
+for src in node_order:
+    if src in final_w and 'NASDAQ' in final_w[src]:
+        print(f"{src:25s} -> NASDAQ : {final_w[src]['NASDAQ']:.4f}")
+
+plt.tight_layout()
 plt.show()
