@@ -1,3 +1,5 @@
+# fcm_nasdaq.py
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -9,6 +11,16 @@ from scipy.stats import pearsonr
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
+import copy
+
+# Try to import Polygon RESTClient; fall back gracefully if not available
+try:
+    from polygon.rest import RESTClient  # type: ignore
+    POLYGON_AVAILABLE = True
+except Exception:
+    RESTClient = None
+    POLYGON_AVAILABLE = False
+
 
 class NASDAQ_FCM:
     def __init__(self):
@@ -142,13 +154,68 @@ def fetch_nasdaq_data(start, end):
     return df
 
 
+# Robust function: attempt to use Polygon RESTClient if available; otherwise fallback to yfinance
+def fetch_data_polygon(ticker, start, end):
+    """
+    Attempt to fetch daily adjusted close prices for `ticker` using Polygon RESTClient if installed.
+    If Polygon is not installed or if the call fails, fall back to yfinance.
+    Returns a DataFrame with an 'Adj Close' column indexed by Timestamp.
+    """
+    if POLYGON_AVAILABLE and RESTClient is not None:
+        try:
+            # RESTClient supports get_aggs(ticker, multiplier, timespan, from_, to)
+            client = RESTClient()  # If you need to pass api_key, set env var per polygon docs or supply here
+            aggs = client.get_aggs(ticker, 1, "day", start, end)
+            if not aggs:
+                # empty result -> fallback
+                raise RuntimeError("Polygon returned no aggregates")
+            data = {'Adj Close': [a.close for a in aggs]}
+            # polygon aggregate objects often have `timestamp` in milliseconds
+            try:
+                index = [pd.to_datetime(a.timestamp, unit='ms') for a in aggs]
+            except Exception:
+                # last resort try to parse from `a` attributes
+                index = [pd.to_datetime(a._raw.get('t', None), unit='ms') if hasattr(a, '_raw') else pd.to_datetime(start) for a in aggs]
+            df = pd.DataFrame(data, index=index)
+            df.index = pd.to_datetime(df.index)
+            # normalize to daily freq and keep business days
+            df = df.sort_index()
+            return df
+        except Exception as e:
+            print(f"Polygon fetch failed ({e}); falling back to yfinance for ticker {ticker}.")
+            # fall through to yfinance fallback
+
+    # Fallback using yfinance
+    # Some ticker formats (like 'I:VIX') may not work with yfinance; map a few common ones:
+    ticker_fallback = ticker
+    if isinstance(ticker, str) and ticker.startswith('I:'):
+        # Index-like prefix; map to common symbol for VIX
+        sym = ticker.split(':', 1)[1]
+        if sym.upper() == 'VIX':
+            ticker_fallback = '^VIX'
+        else:
+            ticker_fallback = sym
+    try:
+        d = yf.download(ticker_fallback, start=start, end=end, progress=False)
+        if d.empty:
+            raise RuntimeError("yfinance returned empty DataFrame")
+        if 'Adj Close' not in d.columns and 'Close' in d.columns:
+            d['Adj Close'] = d['Close']
+        return d[['Adj Close']].copy()
+    except Exception as e:
+        print(f"yfinance fallback failed for {ticker_fallback} ({e}). Returning constant 0.5 series.")
+        # return constant series indexed by business days between start and end
+        idx = pd.date_range(start=start, end=end, freq='B')
+        return pd.DataFrame({'Adj Close': pd.Series(0.5, index=idx)})
+
+
 def run_fcm(fcm, df):
     preds = []
     outer = {k: 0.5 for k in [
-        'Large_Deficits','Foreign_Demand','Low_Unemployment',
-        'Supply_Increase','Energy_Price_Increase','Consumer_Demand',
-        'Business_Investment','Market_Volatility',
-        'Equity_Inflows','AI_Technology_Advances'
+        'Large_Deficits', 'Foreign_Demand', 'Low_Unemployment',
+        'Supply_Increase', 'Energy_Price_Increase', 'Consumer_Demand',
+        'Business_Investment', 'Market_Volatility',
+        'Equity_Inflows', 'AI_Technology_Advances'
     ]}
 
     for _ in range(len(df)):
@@ -159,7 +226,8 @@ def run_fcm(fcm, df):
     return df
 
 
-def run_dynamic_fcm(dynamic_fcm, df, start_date, end_date):
+# Modified to accept source parameter for data fetching (Yahoo or "Google"/Polygon)
+def run_dynamic_fcm(dynamic_fcm, df, start_date, end_date, source='yahoo'):
     preds = []
     outer_base = {k: 0.5 for k in [
         'Large_Deficits', 'Foreign_Demand', 'Low_Unemployment',
@@ -168,21 +236,39 @@ def run_dynamic_fcm(dynamic_fcm, df, start_date, end_date):
         # Note: Market_Volatility, Energy_Price_Increase, AI_Technology_Advances will be overridden
     ]}
 
-    # Fetch real-world proxy data using yfinance
-    proxy_tickers = {
-        'Market_Volatility': '^VIX',              # VIX level
-        'Energy_Price_Increase': 'CL=F',          # Crude oil futures (use pct change)
-        'AI_Technology_Advances': 'NVDA'          # NVIDIA as AI proxy (level)
-    }
+    # NEW: Define tickers based on source
+    if source == 'yahoo':
+        proxy_tickers = {
+            'Market_Volatility': '^VIX',              # VIX level
+            'Energy_Price_Increase': 'CL=F',          # Crude oil futures (use pct change)
+            'AI_Technology_Advances': 'NVDA'          # NVIDIA as AI proxy (level)
+        }
+    else:  # 'google' using Polygon (or fallback)
+        proxy_tickers = {
+            'Market_Volatility': 'I:VIX',
+            'Energy_Price_Increase': 'USO',  # Use USO ETF as proxy for crude oil if polygon/yf works
+            'AI_Technology_Advances': 'NVDA'
+        }
 
     proxy_data = {}
     for name, ticker in proxy_tickers.items():
         try:
-            d = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            if 'Adj Close' not in d.columns:
-                d['Adj Close'] = d['Close']
-            # Reindex to NASDAQ dates, forward/backward fill for missing
-            proxy_data[name] = d['Adj Close'].reindex(df.index).ffill().bfill()
+            if source == 'yahoo':
+                d = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                if 'Adj Close' not in d.columns and 'Close' in d.columns:
+                    d['Adj Close'] = d['Close']
+                proxy_data[name] = d['Adj Close'].reindex(df.index).ffill().bfill()
+            else:
+                # polygon or fallback via fetch_data_polygon
+                d = fetch_data_polygon(ticker, start_date, end_date)
+                # ensure 'Adj Close' column exists
+                if isinstance(d, pd.DataFrame):
+                    if 'Adj Close' not in d.columns and 'Close' in d.columns:
+                        d['Adj Close'] = d['Close']
+                    proxy_data[name] = d['Adj Close'].reindex(df.index).ffill().bfill()
+                else:
+                    # if fetch_data_polygon returns Series-like
+                    proxy_data[name] = pd.Series(d, index=df.index).reindex(df.index).ffill().bfill()
         except Exception as e:
             print(f"Failed to fetch {ticker}: {e}. Using constant 0.5.")
             proxy_data[name] = pd.Series(0.5, index=df.index)
@@ -242,12 +328,13 @@ def run_dynamic_fcm(dynamic_fcm, df, start_date, end_date):
         running_min = min(running_min, close)
         running_max = max(running_max, close)
 
-    df['Dynamic_FCM'] = pd.Series(preds, index=df.index)
-    df['Dynamic_FCM_Return'] = df['Dynamic_FCM'].diff().fillna(0)
+    # NEW: Use source-specific column names for Google/Polygon
+    col_prefix = 'Dynamic_FCM' if source == 'yahoo' else 'Dynamic_FCM_Google'
+    df[col_prefix] = pd.Series(preds, index=df.index)
+    df[col_prefix + '_Return'] = df[col_prefix].diff().fillna(0)
     return df
 
 
-# The rest of the functions remain the same as previous version
 def create_sequences(X, y, window=10):
     if len(X) <= window:
         raise ValueError("Not enough data for LSTM sequences.")
@@ -263,12 +350,20 @@ def train_lstm(df):
     cols = ['FCM_Return', 'Return']
     if 'Dynamic_FCM_Return' in df.columns:
         cols.insert(1, 'Dynamic_FCM_Return')
-    features = scaler.fit_transform(df[cols])
+    # NEW: Add Google FCM return
+    if 'Dynamic_FCM_Google_Return' in df.columns:
+        cols.insert(2, 'Dynamic_FCM_Google_Return')
+    # drop rows with NaN in those columns before fitting scaler
+    feats_df = df[cols].dropna()
+    features = scaler.fit_transform(feats_df)
 
-    if 'Dynamic_FCM_Return' in df.columns:
-        residual = df['Return'] - (df['FCM_Return'] + df['Dynamic_FCM_Return']) / 2
+    # Align residual computation with features_df's index to avoid shape mismatch
+    if 'Dynamic_FCM_Return' in df.columns and 'Dynamic_FCM_Google_Return' in df.columns:
+        residual = df.loc[feats_df.index, 'Return'] - (df.loc[feats_df.index, 'FCM_Return'] + df.loc[feats_df.index, 'Dynamic_FCM_Return'] + df.loc[feats_df.index, 'Dynamic_FCM_Google_Return']) / 3
+    elif 'Dynamic_FCM_Return' in df.columns:
+        residual = df.loc[feats_df.index, 'Return'] - (df.loc[feats_df.index, 'FCM_Return'] + df.loc[feats_df.index, 'Dynamic_FCM_Return']) / 2
     else:
-        residual = df['Return'] - df['FCM_Return']
+        residual = df.loc[feats_df.index, 'Return'] - df.loc[feats_df.index, 'FCM_Return']
 
     X, y = create_sequences(features, residual.values)
 
@@ -292,17 +387,30 @@ def hybrid_predict(df, model, scaler):
     cols = ['FCM_Return', 'Return']
     if 'Dynamic_FCM_Return' in df.columns:
         cols.insert(1, 'Dynamic_FCM_Return')
-    features = scaler.transform(df[cols])
-    X, _ = create_sequences(features, df['Return'].values)
+    # NEW: Add Google FCM return
+    if 'Dynamic_FCM_Google_Return' in df.columns:
+        cols.insert(2, 'Dynamic_FCM_Google_Return')
+
+    # Need to drop NaNs and align so scaler.transform will accept shape
+    feats_df = df[cols].dropna()
+    if feats_df.empty:
+        raise ValueError("No rows available for hybrid prediction after dropping NaNs.")
+
+    features = scaler.transform(feats_df)
+    X, _ = create_sequences(features, df.loc[feats_df.index, 'Return'].values)
 
     residual_pred = model.predict(X, verbose=0).flatten()
-    df = df.iloc[-len(residual_pred):].copy()
-    df['Hybrid_Pred'] = df['FCM_Return'] + residual_pred
+    df_pred = df.loc[feats_df.index].iloc[-len(residual_pred):].copy()
+    df_pred['Hybrid_Pred'] = df_pred['FCM_Return'] + residual_pred
 
-    if 'Dynamic_FCM_Return' in df.columns:
-        df['Hybrid_Dynamic_Pred'] = df['Dynamic_FCM_Return'] + residual_pred
+    if 'Dynamic_FCM_Return' in df_pred.columns:
+        df_pred['Hybrid_Dynamic_Pred'] = df_pred['Dynamic_FCM_Return'] + residual_pred
 
-    return df
+    # NEW: Add hybrid for Google FCM
+    if 'Dynamic_FCM_Google_Return' in df_pred.columns:
+        df_pred['Hybrid_Dynamic_Google_Pred'] = df_pred['Dynamic_FCM_Google_Return'] + residual_pred
+
+    return df_pred
 
 
 def plot_metrics(df):
@@ -318,8 +426,15 @@ def plot_metrics(df):
     if 'Dynamic_FCM_Return' in df.columns:
         corr_dyn = np.nan_to_num(pearsonr(df['Dynamic_FCM_Return'], df['Return'])[0])
         rmse_dyn = np.sqrt(mean_squared_error(df['Return'], df['Dynamic_FCM_Return']))
-        plt.plot(df.index, df['Dynamic_FCM_Return'], label=f'Dynamic FCM (corr={corr_dyn:.2f}, RMSE={rmse_dyn:.4f})',
+        plt.plot(df.index, df['Dynamic_FCM_Return'], label=f'Dynamic FCM Yahoo (corr={corr_dyn:.2f}, RMSE={rmse_dyn:.4f})',
                  linestyle='-.', alpha=0.7)
+
+    # NEW: Plot for Google FCM
+    if 'Dynamic_FCM_Google_Return' in df.columns:
+        corr_dyn_g = np.nan_to_num(pearsonr(df['Dynamic_FCM_Google_Return'], df['Return'])[0])
+        rmse_dyn_g = np.sqrt(mean_squared_error(df['Return'], df['Dynamic_FCM_Google_Return']))
+        plt.plot(df.index, df['Dynamic_FCM_Google_Return'], label=f'Dynamic FCM Google (corr={corr_dyn_g:.2f}, RMSE={rmse_dyn_g:.4f})',
+                 linestyle=':', alpha=0.7)
 
     if 'Hybrid_Pred' in df.columns:
         corr_h = np.nan_to_num(pearsonr(df['Hybrid_Pred'], df['Return'])[0])
@@ -330,28 +445,48 @@ def plot_metrics(df):
     if 'Hybrid_Dynamic_Pred' in df.columns:
         corr_hd = np.nan_to_num(pearsonr(df['Hybrid_Dynamic_Pred'], df['Return'])[0])
         rmse_hd = np.sqrt(mean_squared_error(df['Return'], df['Hybrid_Dynamic_Pred']))
-        plt.plot(df.index, df['Hybrid_Dynamic_Pred'], label=f'Hybrid Dynamic (corr={corr_hd:.2f}, RMSE={rmse_hd:.4f})',
+        plt.plot(df.index, df['Hybrid_Dynamic_Pred'], label=f'Hybrid Dynamic Yahoo (corr={corr_hd:.2f}, RMSE={rmse_hd:.4f})',
                  linewidth=2, linestyle=':')
+
+    # NEW: Plot for Hybrid Google
+    if 'Hybrid_Dynamic_Google_Pred' in df.columns:
+        corr_hdg = np.nan_to_num(pearsonr(df['Hybrid_Dynamic_Google_Pred'], df['Return'])[0])
+        rmse_hdg = np.sqrt(mean_squared_error(df['Return'], df['Hybrid_Dynamic_Google_Pred']))
+        plt.plot(df.index, df['Hybrid_Dynamic_Google_Pred'], label=f'Hybrid Dynamic Google (corr={corr_hdg:.2f}, RMSE={rmse_hdg:.4f})',
+                 linewidth=2, linestyle='--')
 
     plt.legend()
     plt.grid(alpha=0.3)
-    plt.title("NASDAQ FCM + LSTM Accuracy (Static vs Dynamic with Real Data)")
+    # NEW: Updated title to include comparison
+    plt.title("NASDAQ FCM + LSTM Accuracy (Static vs Dynamic Yahoo vs Dynamic Google)")
     plt.tight_layout()
     plt.savefig("fcm_lstm_accuracy.png", dpi=300)
     plt.show()
 
 
 if __name__ == "__main__":
+    # Example dates - adjust as needed
     start_date = "2025-01-29"
     end_date = "2026-01-29"
 
     fcm_static = NASDAQ_FCM()
     fcm_dynamic = DynamicNASDAQ_FCM(learning_rate=0.002)
+    # NEW: Create another dynamic FCM for "Google" data source
+    fcm_dynamic_google = DynamicNASDAQ_FCM(learning_rate=0.002)
 
     df = fetch_nasdaq_data(start_date, end_date)
 
     df = run_fcm(fcm_static, df)
     df = run_dynamic_fcm(fcm_dynamic, df, start_date, end_date)
+
+    # Run Google/Polygon-backed dynamic FCM (falls back to yfinance if polygon not installed)
+    df_google = df.copy()
+    df_google = run_dynamic_fcm(fcm_dynamic_google, df_google, start_date, end_date, source='google')
+
+    # merge Google dynamic columns back into main df if present
+    if 'Dynamic_FCM_Google' in df_google.columns:
+        df['Dynamic_FCM_Google'] = df_google['Dynamic_FCM_Google']
+        df['Dynamic_FCM_Google_Return'] = df_google['Dynamic_FCM_Google_Return']
 
     model, scaler = train_lstm(df)
     final_df = hybrid_predict(df, model, scaler)

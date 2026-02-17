@@ -2,24 +2,34 @@
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
-import yfinance as yf  # pip install yfinance
+import yfinance as yf   
 import pandas as pd
 from datetime import datetime, timedelta
 import copy
 from matplotlib.animation import FuncAnimation
 
+# NEW: Try to import Polygon for Google proxies
+try:
+    from polygon.rest import RESTClient
+    POLYGON_AVAILABLE = True
+except Exception:
+    RESTClient = None
+    POLYGON_AVAILABLE = False
+
 # -------------------------
 # --- Canvas & axes setup
 # -------------------------
-fig, (ax_static, ax_dyn) = plt.subplots(1, 2, figsize=(36, 14))
-for ax in (ax_static, ax_dyn):
+# NEW: Changed to 1x3 subplots for adding Google dynamic panel
+fig, axs = plt.subplots(1, 3, figsize=(54, 14))
+ax_static, ax_dyn_yahoo, ax_dyn_google = axs
+for ax in axs:
     ax.set_xlim(0, 20)
     ax.set_ylim(0, 14)
     ax.set_aspect('equal')
     ax.axis('off')
 
 # -------------------------
-# --- Nodes + layout (unchanged)
+# --- Nodes + layout 
 # -------------------------
 outer_nodes = [
     ('Large_Deficits', '^IRX', '13W Treasury Bill', 1.5, 12),
@@ -46,7 +56,7 @@ inner_nodes = [
 node_order = [n[0] for n in outer_nodes] + [n[0] for n in inner_nodes]
 
 # -------------------------
-# --- Drawing helper funcs (unchanged visuals)
+# --- Drawing helper funcs 
 # -------------------------
 def draw_outer_node(ax, name, ticker, desc, x, y):
     box = mpatches.FancyBboxPatch((x-1.4, y-0.6), 2.8, 1.2,
@@ -98,7 +108,7 @@ PROXY ISSUES:
 draw_base_layout(ax_static, show_legend=True)
 
 # -------------------------
-# --- Connections (same as your code)
+# --- Connections 
 # -------------------------
 connections = [
     # To Monetary Policy (green = positive)
@@ -265,6 +275,69 @@ inputs['AI_Technology'] = safe_return('NVDA')
 inputs_norm = (inputs - inputs.min()) / (inputs.max() - inputs.min() + 1e-8)
 inputs_norm = inputs_norm.clip(0, 1).fillna(0.5)
 
+# NEW: For Google (Polygon) proxies
+google_ticker_map = {
+    '^IRX': 'I:IRX',
+    'UUP': 'UUP',
+    'XLI': 'XLI',
+    'XLE': 'USO',
+    'XLY': 'XLY',
+    '^VIX': 'I:VIX',
+    'SPY': 'SPY',
+    'NVDA': 'NVDA',
+}
+
+def fetch_data_polygon(ticker, start, end):
+    if POLYGON_AVAILABLE and RESTClient is not None:
+        try:
+            client = RESTClient()
+            start_ts = int(pd.to_datetime(start).timestamp() * 1000)
+            end_ts = int(pd.to_datetime(end).timestamp() * 1000)
+            aggs = client.get_aggs(ticker, 1, "day", start_ts, end_ts)
+            if not aggs:
+                raise RuntimeError("Polygon returned no aggregates")
+            data = {'Adj Close': [a.close for a in aggs]}
+            index = [pd.to_datetime(a.timestamp, unit='ms').date() for a in aggs]
+            df = pd.DataFrame(data, index=index)
+            df.index = pd.to_datetime(df.index)
+            return df
+        except Exception as e:
+            print(f"Polygon fetch failed ({e}); falling back to yfinance for {ticker}.")
+    # Fallback to yfinance
+    try:
+        d = yf.download(ticker, start=start, end=end, progress=False)
+        if 'Adj Close' not in d.columns:
+            d['Adj Close'] = d['Close']
+        return d[['Adj Close']]
+    except Exception as e:
+        print(f"yfinance fallback failed ({e}). Returning constant 0.5.")
+        idx = pd.date_range(start, end, freq='B')
+        return pd.DataFrame({'Adj Close': [0.5] * len(idx)}, index=idx)
+
+def safe_series_google(sym, default=0.5):
+    sym_g = google_ticker_map.get(sym, sym)
+    d = fetch_data_polygon(sym_g, start_date, end_date)
+    return d['Adj Close'].reindex(raw.index).ffill().bfill()
+
+def safe_return_google(sym):
+    series = safe_series_google(sym)
+    return series.pct_change().fillna(0)
+
+inputs_google = pd.DataFrame(index=raw.index, columns=[n for n in node_order[:10]], dtype=float)
+inputs_google['Large_Deficits'] = safe_series_google('^IRX') / 100.0
+inputs_google['Foreign_Demand'] = safe_return_google('UUP')
+inputs_google['Low_Unemployment'] = 0.5
+inputs_google['Supply_Increase'] = safe_return_google('XLI')
+inputs_google['Energy_Price_Increase'] = safe_return_google('XLE')
+inputs_google['Consumer_Demand'] = safe_return_google('XLY')
+inputs_google['Business_Investment'] = safe_return_google('XLI')
+inputs_google['Market_Volatility'] = safe_series_google('^VIX') / 50.0
+inputs_google['Equity_Inflows'] = safe_return_google('SPY')
+inputs_google['AI_Technology'] = safe_return_google('NVDA')
+
+inputs_norm_google = (inputs_google - inputs_google.min()) / (inputs_google.max() - inputs_google.min() + 1e-8)
+inputs_norm_google = inputs_norm_google.clip(0, 1).fillna(0.5)
+
 # Actual NASDAQ returns & normalized actual used as target
 actual_returns = returns['^IXIC'] if '^IXIC' in returns.columns else pd.Series(0.0, index=returns.index)
 actual_norm = (actual_returns - actual_returns.min()) / (actual_returns.max() - actual_returns.min() + 1e-8)
@@ -390,7 +463,62 @@ dyn_norm = (dyn_series - dyn_series.min()) / (dyn_series.max() - dyn_series.min(
 valid_idx_dyn = dyn_norm.dropna().index.intersection(valid_idx)
 dynamic_corr = dyn_norm.loc[valid_idx_dyn].corr(actual_norm.loc[valid_idx_dyn])
 dynamic_mse = ((dyn_norm.loc[valid_idx_dyn] - actual_norm.loc[valid_idx_dyn]) ** 2).mean()
-print(f"Dynamic FCM metrics (lagged): corr={dynamic_corr:.4f}, normalized MSE={dynamic_mse:.6f}")
+print(f"Dynamic FCM Yahoo metrics (lagged): corr={dynamic_corr:.4f}, normalized MSE={dynamic_mse:.6f}")
+
+# NEW: Dynamic FCM for Google
+dynamic_weights_google = copy.deepcopy(weights_dict)
+
+weights_history_google = []
+pred_history_google = []
+date_history_google = []
+
+print("Running online updates to build dynamic Google weight history...")
+for idx in range(1, n_steps):
+    date = dates[idx]
+    prev_date = dates[idx-1]
+    outer_prev = inputs_norm_google.loc[prev_date]
+
+    state = compute_state_from_outer(outer_prev, dynamic_weights_google, node_order)
+    pred = state['NASDAQ']
+
+    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
+
+    error = target - pred
+    grad = pred * (1 - pred)
+    delta = error * grad
+
+    for src in node_order:
+        if src in dynamic_weights_google and 'NASDAQ' in dynamic_weights_google[src]:
+            dynamic_weights_google[src]['NASDAQ'] += learning_rate * delta * state[src]
+            dynamic_weights_google[src]['NASDAQ'] = np.clip(dynamic_weights_google[src]['NASDAQ'], -weight_clip, weight_clip)
+
+    if (idx % skip) == 0 or idx == n_steps - 1:
+        weights_history_google.append(copy.deepcopy(dynamic_weights_google))
+        pred_history_google.append(pred)
+        date_history_google.append(date)
+
+# replay for Google
+dynamic_weights_replay_google = copy.deepcopy(weights_dict)
+dyn_series_google = pd.Series(index=inputs_norm_google.index, dtype=float)
+for idx in range(1, n_steps):
+    date = dates[idx]
+    prev_date = dates[idx-1]
+    state = compute_state_from_outer(inputs_norm_google.loc[prev_date], dynamic_weights_replay_google, node_order)
+    dyn_series_google.loc[date] = state['NASDAQ']
+    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
+    error = target - state['NASDAQ']
+    grad = state['NASDAQ'] * (1 - state['NASDAQ'])
+    delta = error * grad
+    for src in node_order:
+        if src in dynamic_weights_replay_google and 'NASDAQ' in dynamic_weights_replay_google[src]:
+            dynamic_weights_replay_google[src]['NASDAQ'] += learning_rate * delta * state[src]
+            dynamic_weights_replay_google[src]['NASDAQ'] = np.clip(dynamic_weights_replay_google[src]['NASDAQ'], -weight_clip, weight_clip)
+
+dyn_norm_google = (dyn_series_google - dyn_series_google.min()) / (dyn_series_google.max() - dyn_series_google.min() + 1e-8)
+valid_idx_dyn_google = dyn_norm_google.dropna().index.intersection(valid_idx)
+dynamic_corr_google = dyn_norm_google.loc[valid_idx_dyn_google].corr(actual_norm.loc[valid_idx_dyn_google])
+dynamic_mse_google = ((dyn_norm_google.loc[valid_idx_dyn_google] - actual_norm.loc[valid_idx_dyn_google]) ** 2).mean()
+print(f"Dynamic FCM Google metrics (lagged): corr={dynamic_corr_google:.4f}, normalized MSE={dynamic_mse_google:.6f}")
 
 # -------------------------
 # --- Prepare dynamic panel drawing utilities
@@ -446,20 +574,32 @@ def draw_arrows_dynamic(ax, wdict, annotate_weights=True):
 
 # initialize dynamic panel with first snapshot (or baseline)
 initial_weights = weights_history[0] if weights_history else weights_dict
-draw_arrows_dynamic(ax_dyn, initial_weights)
-ax_dyn.text(10, 13.2, 'Dynamic FCM (weights update over time)', ha='center', fontsize=12, fontweight='bold')
+draw_arrows_dynamic(ax_dyn_yahoo, initial_weights)
+ax_dyn_yahoo.text(10, 13.2, 'Dynamic FCM Yahoo (weights update over time)', ha='center', fontsize=12, fontweight='bold')
+
+# NEW: Initialize Google dynamic panel
+initial_weights_google = weights_history_google[0] if weights_history_google else weights_dict
+draw_arrows_dynamic(ax_dyn_google, initial_weights_google)
+ax_dyn_google.text(10, 13.2, 'Dynamic FCM Google (weights update over time)', ha='center', fontsize=12, fontweight='bold')
 
 # -------------------------
-# --- Animation update function
+# --- Animation function
 # -------------------------
 def update_frame(idx):
     wdict = weights_history[idx]
     date = date_history[idx] if idx < len(date_history) else None
-    draw_arrows_dynamic(ax_dyn, wdict, annotate_weights=True)
-    txt = f"Dynamic weights snapshot\nDate: {date.strftime('%Y-%m-%d') if date is not None else 'N/A'}"
-    ax_dyn.text(10, 13.2, txt, ha='center', fontsize=12, fontweight='bold')
+    draw_arrows_dynamic(ax_dyn_yahoo, wdict, annotate_weights=True)
+    txt = f"Dynamic Yahoo weights snapshot\nDate: {date.strftime('%Y-%m-%d') if date is not None else 'N/A'}"
+    ax_dyn_yahoo.text(10, 13.2, txt, ha='center', fontsize=12, fontweight='bold')
 
-frames = len(weights_history)
+    # NEW: Update Google panel
+    wdict_g = weights_history_google[idx]
+    draw_arrows_dynamic(ax_dyn_google, wdict_g, annotate_weights=True)
+    txt_g = f"Dynamic Google weights snapshot\nDate: {date.strftime('%Y-%m-%d') if date is not None else 'N/A'}"
+    ax_dyn_google.text(10, 13.2, txt_g, ha='center', fontsize=12, fontweight='bold')
+
+# NEW: Use min frames for both histories
+frames = min(len(weights_history), len(weights_history_google))
 if frames == 0:
     print("No dynamic weight history produced; skipping animation.")
 else:
@@ -470,13 +610,21 @@ else:
 # -------------------------
 print("\nFINAL METRICS:")
 print(f"Static FCM corr: {static_corr:.4f}, static MSE: {static_mse:.6f}")
-print(f"Dynamic FCM corr: {dynamic_corr:.4f}, dynamic MSE: {dynamic_mse:.6f}")
+print(f"Dynamic Yahoo FCM corr: {dynamic_corr:.4f}, dynamic MSE: {dynamic_mse:.6f}")
+print(f"Dynamic Google FCM corr: {dynamic_corr_google:.4f}, dynamic MSE: {dynamic_mse_google:.6f}")
 
 final_w = weights_history[-1] if weights_history else weights_dict
-print("\nFinal incoming NASDAQ weights (dynamic snapshot):")
+print("\nFinal incoming NASDAQ weights (dynamic Yahoo snapshot):")
 for src in node_order:
     if src in final_w and 'NASDAQ' in final_w[src]:
         print(f"{src:25s} -> NASDAQ : {final_w[src]['NASDAQ']:.4f}")
+
+# NEW: Print final Google weights
+final_w_g = weights_history_google[-1] if weights_history_google else weights_dict
+print("\nFinal incoming NASDAQ weights (dynamic Google snapshot):")
+for src in node_order:
+    if src in final_w_g and 'NASDAQ' in final_w_g[src]:
+        print(f"{src:25s} -> NASDAQ : {final_w_g[src]['NASDAQ']:.4f}")
 
 plt.tight_layout()
 plt.show()
