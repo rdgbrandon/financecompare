@@ -1,639 +1,1189 @@
-# visualize_fcm.py
+#!/usr/bin/env python3
+"""
+visualize_fcm.py
+
+Comprehensive visualization suite for the dynamic FCM and sentiment analysis.
+Visualizes:
+ - Sentiment time series (Yahoo vs Google vs unified)
+ - Model predictions vs actual normalized NASDAQ
+ - Daily returns colored by sentiment
+ - FCM network with dynamic weights and activations
+ - Performance metrics (correlation, MSE) for both sources
+ - Weight evolution over time
+"""
+import os
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
 import numpy as np
-import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta
-import copy
-from matplotlib.animation import FuncAnimation
-# NEW: Try to import Polygon for Google proxies
-try:
-    from polygon.rest import RESTClient
-    POLYGON_AVAILABLE = True
-except Exception:
-    RESTClient = None
-    POLYGON_AVAILABLE = False
-# -------------------------
-# --- Canvas & axes setup
-# -------------------------
-# NEW: Changed to 1x3 subplots for adding Google dynamic panel
-fig, axs = plt.subplots(1, 3, figsize=(54, 14))
-ax_static, ax_dyn_yahoo, ax_dyn_google = axs
-for ax in axs:
-    ax.set_xlim(0, 20)
-    ax.set_ylim(0, 14)
-    ax.set_aspect('equal')
-    ax.axis('off')
-# -------------------------
-# --- Nodes + layout
-# -------------------------
-outer_nodes = [
-    ('Large_Deficits', '^IRX', '13W Treasury Bill', 1.5, 12),
-    ('Foreign_Demand', 'UUP', 'US Dollar Index', 1.5, 10),
-    ('Low_Unemployment', 'N/A', 'No proxy (uses 0.5)', 1.5, 8),
-    ('Supply_Increase', 'XLI', 'Industrial ETF', 1.5, 6),
-    ('Energy_Price_Increase', 'XLE', 'Energy ETF', 1.5, 4),
-    ('Consumer_Demand', 'XLY', 'Consumer Discr. ETF', 6, 1),
-    ('Business_Investment', 'XLI', 'Industrial ETF (DUPLICATE)', 9, 1),
-    ('Market_Volatility', '^VIX', 'Volatility Index', 12, 1),
-    ('Equity_Inflows', 'SPY', 'S&P 500 ETF', 15, 1),
-    ('AI_Technology', 'NVDA', 'NVIDIA', 18, 4),
-    ('News_Sentiment', 'N/A', 'News Sentiment', 18, 7),
-]
-inner_nodes = [
-    ('Monetary_Policy', 8, 10),
-    ('Inflation', 8, 7),
-    ('Corporate_Earnings', 12, 10),
-    ('Investor_Sentiment', 12, 7),
-    ('NASDAQ', 15, 8.5),
-]
-# canonical node order (outer -> inner -> target)
-node_order = [n[0] for n in outer_nodes] + [n[0] for n in inner_nodes]
-# -------------------------
-# --- Drawing helper funcs
-# -------------------------
-def draw_outer_node(ax, name, ticker, desc, x, y):
-    box = mpatches.FancyBboxPatch((x-1.4, y-0.6), 2.8, 1.2,
-                                   boxstyle="round,pad=0.05",
-                                   facecolor='lightblue', edgecolor='black', linewidth=2)
-    ax.add_patch(box)
-    ax.text(x, y+0.2, name.replace('_', '\n'), ha='center', va='center', fontsize=8, fontweight='bold')
-    ax.text(x, y-0.35, f'{ticker}', ha='center', va='center', fontsize=7, color='darkblue')
-def draw_inner_node(ax, name, x, y):
-    circle = plt.Circle((x, y), 0.9, facecolor='lightyellow', edgecolor='black', linewidth=2)
-    ax.add_patch(circle)
-    ax.text(x, y, name.replace('_', '\n'), ha='center', va='center', fontsize=8, fontweight='bold')
-def draw_target_node(ax, name, x, y):
-    circle = plt.Circle((x, y), 1.1, facecolor='lightgreen', edgecolor='darkgreen', linewidth=3)
-    ax.add_patch(circle)
-    ax.text(x, y, name, ha='center', va='center', fontsize=12, fontweight='bold')
-# draw base layout onto a given axis (nodes + legends + proxy text)
-def draw_base_layout(ax, show_legend=True):
-    for name, ticker, desc, x, y in outer_nodes:
-        draw_outer_node(ax, name, ticker, desc, x, y)
-    for name, x, y in inner_nodes[:-1]:
-        draw_inner_node(ax, name, x, y)
-    draw_target_node(ax, 'NASDAQ', 15, 8.5)
-    if show_legend:
-        legend_elements = [
-            mpatches.Patch(facecolor='lightblue', edgecolor='black', label='Outer Nodes (Yahoo Finance proxies)'),
-            mpatches.Patch(facecolor='lightyellow', edgecolor='black', label='Inner Nodes (computed)'),
-            mpatches.Patch(facecolor='lightgreen', edgecolor='darkgreen', label='Target Node (NASDAQ)'),
-            plt.Line2D([0], [0], color='green', linewidth=3, label='Positive weight'),
-            plt.Line2D([0], [0], color='red', linewidth=3, label='Negative weight'),
-        ]
-        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
-    ax.text(10, 13.5, 'FCM Node Structure & Proxy Assignments', ha='center', fontsize=16, fontweight='bold')
-    ax.text(10, 13, 'Blue boxes = Input nodes with Yahoo Finance ticker proxies', ha='center', fontsize=10)
-    proxy_text = """
-PROXY ISSUES:
-• XLI used for BOTH Supply_Increase AND Business_Investment
-• Most proxies are stock prices, not economic indicators
-• Low_Unemployment has NO proxy (defaults to 0.5)
-• All data is same-day (no prediction lag)
-"""
-    ax.text(0.5, 2.5, proxy_text, fontsize=9, va='top',
-            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
-# draw base layout on static side
-draw_base_layout(ax_static, show_legend=True)
-# -------------------------
-# --- Connections
-# -------------------------
-connections = [
-    # To Monetary Policy (green = positive)
-    (1.5, 12, 8, 10, 0.7, 'green'), # Large_Deficits
-    (1.5, 10, 8, 10, 0.5, 'green'), # Foreign_Demand
-    (1.5, 8, 8, 10, 0.6, 'green'), # Low_Unemployment
-    # To Inflation
-    (8, 10, 8, 7, 0.8, 'green'), # Monetary_Policy
-    (1.5, 8, 8, 7, 0.6, 'green'), # Low_Unemployment
-    (1.5, 6, 8, 7, 0.6, 'green'), # Supply_Increase
-    (1.5, 4, 8, 7, 0.7, 'green'), # Energy_Price_Increase
-    (6, 1, 8, 7, 0.5, 'green'), # Consumer_Demand
-    # To Corporate Earnings
-    (9, 1, 12, 10, 0.7, 'green'), # Business_Investment
-    (8, 7, 12, 10, 0.4, 'green'), # Inflation
-    (6, 1, 12, 10, 0.6, 'green'), # Consumer_Demand
-    (8, 10, 12, 10, -0.6, 'red'), # Monetary_Policy (negative)
-    # To Investor Sentiment
-    (12, 10, 12, 7, 0.8, 'green'), # Corporate_Earnings
-    (8, 7, 12, 7, -0.5, 'red'), # Inflation (negative)
-    (12, 1, 12, 7, 0.3, 'green'), # Market_Volatility
-    (15, 1, 12, 7, 0.7, 'green'), # Equity_Inflows
-    (18, 7, 12, 7, 0.6, 'green'), # News_Sentiment
-    # To NASDAQ
-    (12, 7, 15, 8.5, 0.9, 'green'), # Investor_Sentiment
-    (12, 10, 15, 8.5, 0.8, 'green'), # Corporate_Earnings
-    (8, 7, 15, 8.5, -0.4, 'red'), # Inflation (negative)
-    (8, 10, 15, 8.5, -0.5, 'red'), # Monetary_Policy (negative)
-    (18, 4, 15, 8.5, 0.7, 'green'), # AI_Technology
-    (18, 7, 15, 8.5, 0.4, 'green'), # News_Sentiment
-]
-# Build pos->name mapping for convenience
-pos_to_name = {}
-for name, _, _, x, y in outer_nodes:
-    pos_to_name[(x, y)] = name
-for name, x, y in inner_nodes:
-    pos_to_name[(x, y)] = name
-# Build static weights dict (from connections)
-weights_static_from_connections = {}
-for x1, y1, x2, y2, weight, _ in connections:
-    src = pos_to_name.get((x1, y1))
-    tgt = pos_to_name.get((x2, y2))
-    if src and tgt:
-        weights_static_from_connections.setdefault(src, {})[tgt] = weight
-# Draw arrows on static axis using original connection weights (exact parity)
-def draw_arrows_on_axis(ax, weights_dict_local, annotate_weights=True):
-    for x1, y1, x2, y2, weight_orig, _ in connections:
-        dx, dy = x2 - x1, y2 - y1
-        dist = np.sqrt(dx**2 + dy**2)
-        offset1 = 1.0 if x1 < 5 else 0.9
-        offset2 = 1.1 if (x2, y2) == (15, 8.5) else 0.9
-        start_x = x1 + (dx/dist) * offset1
-        start_y = y1 + (dy/dist) * offset1
-        end_x = x2 - (dx/dist) * offset2
-        end_y = y2 - (dy/dist) * offset2
-        src = pos_to_name.get((x1, y1))
-        tgt = pos_to_name.get((x2, y2))
-        w = weight_orig
-        if src and tgt:
-            w = weights_dict_local.get(src, {}).get(tgt, weight_orig)
-        color = 'green' if w >= 0 else 'red'
-        ax.annotate('', xy=(end_x, end_y), xytext=(start_x, start_y),
-                    arrowprops=dict(arrowstyle='->', color=color, lw=max(0.5, abs(w)*3.0), alpha=0.8))
-        if annotate_weights:
-            mid_x, mid_y = (start_x + end_x) / 2, (start_y + end_y) / 2
-            ax.text(mid_x, mid_y, f'{w:.2f}', fontsize=7, ha='center', va='center',
-                    bbox=dict(boxstyle='round', facecolor='white', edgecolor=color, alpha=0.8))
-draw_arrows_on_axis(ax_static, weights_static_from_connections, annotate_weights=True)
-plt.savefig('fcm_structure.png', dpi=150, bbox_inches='tight', facecolor='white')
-print("Saved static diagram to fcm_structure.png")
-# -------------------------
-# --- Data fetching (robust)
-# -------------------------
-end_date = datetime.now().strftime('%Y-%m-%d')
-start_date = (datetime.now() - timedelta(days=5*365 + 100)).strftime('%Y-%m-%d')
-tickers = {
-    'Large_Deficits': '^IRX',
-    'Foreign_Demand': 'UUP',
-    'Supply_Increase': 'XLI',
-    'Energy_Price_Increase': 'XLE',
-    'Consumer_Demand': 'XLY',
-    'Business_Investment': 'XLI',
-    'Market_Volatility': '^VIX',
-    'Equity_Inflows': 'SPY',
-    'AI_Technology': ['NVDA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN'],
-    'NASDAQ': '^IXIC' # real target
+from datetime import datetime
+import networkx as nx
+import logging
+
+# Import the core pipeline
+from fcm_nasdaq import prepare_data_and_run, compute_state_from_outer, CONFIG
+
+logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=logging.INFO)
+logger = logging.getLogger("visualize_fcm")
+
+# ===== Master Color Palette & Typography System =====
+COLORS = {
+    "yahoo_primary": "#1f77b4",      # Blue for Yahoo
+    "google_primary": "#ff7f0e",     # Orange for Google
+    "actual": "#2ca02c",              # Green for actual values
+    "prediction": "#d62728",          # Red for predictions
+    "lstm": "#9467bd",                # Purple for LSTM
+    "gru": "#8c564b",                 # Brown for GRU
+    "ensemble": "#e377c2",            # Pink for Ensemble
+    "fcm_static": "#17becf"           # Cyan for static FCM
 }
-print("Fetching data...")
-tickers_list = []
-for t in tickers.values():
-    if isinstance(t, list):
-        tickers_list.extend(t)
-    else:
-        tickers_list.append(t)
-tickers_list = list(set(tickers_list))
-try:
-    raw_all = yf.download(tickers_list, start=start_date, end=end_date, auto_adjust=True, progress=False)
-except Exception as e:
-    print("yfinance download error:", e)
-    raw_all = pd.DataFrame(index=pd.date_range(start=start_date, end=end_date))
-# Normalize download result to a single-level series of prices
-# If yfinance returned a DataFrame with MultiIndex columns choose 'Close' or auto_adjust ensured Close exists
-if isinstance(raw_all.columns, pd.MultiIndex):
-    # prefer 'Close' if available in top-level, else try to collapse second level
-    if 'Close' in raw_all.columns.levels[0]:
-        raw = raw_all['Close']
-    else:
-        # Collapse by taking top-level first available price column
-        raw = raw_all.xs(raw_all.columns.levels[0][0], axis=1, level=0, drop_level=True)
-elif 'Close' in raw_all.columns:
-    raw = raw_all['Close']
-elif 'Adj Close' in raw_all.columns:
-    raw = raw_all['Adj Close']
-else:
-    # fallback: if raw_all itself is single column series or similar, try to use it
-    raw = raw_all.copy()
-# ensure all tickers exist as columns
-for t in tickers_list:
-    if t not in raw.columns:
-        raw[t] = np.nan
-raw = raw.sort_index().ffill().bfill()
-# compute returns; use fill_method=None to avoid FutureWarning
-returns = raw.pct_change(fill_method=None).fillna(0)
-# Build input proxies (safe)
-inputs = pd.DataFrame(index=raw.index, columns=[n for n in node_order[:11]], dtype=float)
-def safe_series(sym, default=0.5):
-    if sym in raw.columns:
-        return raw[sym].copy()
-    else:
-        print(f"Warning: ticker {sym} missing — using constant proxy {default}")
-        return pd.Series(default, index=raw.index)
-def safe_return(sym):
-    if sym in returns.columns:
-        return returns[sym].copy()
-    else:
-        print(f"Warning: returns for {sym} missing — using 0.0")
-        return pd.Series(0.0, index=returns.index)
-inputs['Large_Deficits'] = safe_series('^IRX') / 100.0
-inputs['Foreign_Demand'] = safe_return('UUP')
-inputs['Low_Unemployment'] = 0.5
-inputs['Supply_Increase'] = safe_return('XLI')
-inputs['Energy_Price_Increase'] = safe_return('XLE')
-inputs['Consumer_Demand'] = safe_return('XLY')
-inputs['Business_Investment'] = safe_return('XLI')
-inputs['Market_Volatility'] = safe_series('^VIX') / 50.0
-inputs['Equity_Inflows'] = safe_return('SPY')
-tech_returns = [safe_return(t) for t in tickers['AI_Technology']]
-inputs['AI_Technology'] = pd.concat(tech_returns, axis=1).mean(axis=1)
-# Add news sentiment
-news_sentiment_dict = {}
-if POLYGON_AVAILABLE:
-    try:
-        client = RESTClient()
-        positive_words = ['rise', 'gain', 'positive', 'bull', 'growth', 'up']
-        negative_words = ['fall', 'loss', 'negative', 'bear', 'decline', 'down']
-        for date in raw.index:
-            date_str = date.strftime('%Y-%m-%d')
-            news = client.list_ticker_news('^IXIC', published_utc_gte=date_str, published_utc_lte=date_str, limit=100)
-            pos_count = 0
-            neg_count = 0
-            for n in news:
-                title = n.title.lower() if n.title else ''
-                desc = n.description.lower() if n.description else ''
-                text = title + ' ' + desc
-                pos_count += sum(text.count(w) for w in positive_words)
-                neg_count += sum(text.count(w) for w in negative_words)
-            total = pos_count + neg_count
-            if total > 0:
-                score = (pos_count - neg_count) / total
-            else:
-                score = 0
-            sentiment = 1 / (1 + np.exp(-score * 5))  # sigmoid
-            news_sentiment_dict[date] = sentiment
-    except Exception as e:
-        print(f"News sentiment fetch failed ({e}). Using constant 0.5.")
-        news_sentiment_dict = {d: 0.5 for d in raw.index}
-else:
-    news_sentiment_dict = {d: 0.5 for d in raw.index}
-inputs['News_Sentiment'] = pd.Series(news_sentiment_dict).reindex(inputs.index).fillna(0.5)
-# Normalize to [0,1]
-inputs_norm = (inputs - inputs.min()) / (inputs.max() - inputs.min() + 1e-8)
-inputs_norm = inputs_norm.clip(0, 1).fillna(0.5)
-# NEW: For Google (Polygon) proxies
-google_ticker_map = {
-    '^IRX': 'I:IRX',
-    'UUP': 'UUP',
-    'XLI': 'XLI',
-    'XLE': 'USO',
-    'XLY': 'XLY',
-    '^VIX': 'I:VIX',
-    'SPY': 'SPY',
-    'NVDA': 'NVDA',
-    'AAPL': 'AAPL',
-    'MSFT': 'MSFT',
-    'GOOGL': 'GOOGL',
-    'AMZN': 'AMZN',
+
+FONT_SIZES = {
+    "title": 14,
+    "subtitle": 12,
+    "label": 11,
+    "legend": 10,
+    "annotation": 9,
+    "small": 8
 }
-def fetch_data_polygon(ticker, start, end, original_ticker=None):
-    """Fetch data from Polygon with fallback to yfinance using original_ticker if provided."""
-    if POLYGON_AVAILABLE and RESTClient is not None:
-        try:
-            client = RESTClient()
-            start_ts = int(pd.to_datetime(start).timestamp() * 1000)
-            end_ts = int(pd.to_datetime(end).timestamp() * 1000)
-            aggs = client.get_aggs(ticker, 1, "day", start_ts, end_ts)
-            if not aggs:
-                raise RuntimeError("Polygon returned no aggregates")
-            data = {'Adj Close': [a.close for a in aggs]}
-            index = [pd.to_datetime(a.timestamp, unit='ms').date() for a in aggs]
-            df = pd.DataFrame(data, index=index)
-            df.index = pd.to_datetime(df.index)
-            return df
-        except Exception as e:
-            print(f"Polygon fetch failed ({e}); falling back to yfinance for {ticker}.")
-    # Fallback to yfinance using original_ticker if provided, otherwise ticker
-    fallback_ticker = original_ticker if original_ticker is not None else ticker
-    try:
-        d = yf.download(fallback_ticker, start=start, end=end, progress=False)
-        if 'Adj Close' not in d.columns:
-            d['Adj Close'] = d['Close']
-        return d[['Adj Close']]
-    except Exception as e:
-        print(f"yfinance fallback failed ({e}). Returning constant 0.5.")
-        idx = pd.date_range(start, end, freq='B')
-        return pd.DataFrame({'Adj Close': [0.5] * len(idx)}, index=idx)
-def safe_series_google(sym, default=0.5):
-    sym_g = google_ticker_map.get(sym, sym)
-    # Pass original ticker as fallback in case Polygon format fails
-    d = fetch_data_polygon(sym_g, start_date, end_date, original_ticker=sym)
-    return d['Adj Close'].reindex(raw.index).ffill().bfill()
-def safe_return_google(sym):
-    try:
-        series = safe_series_google(sym)
-        return series.pct_change().fillna(0)
-    except Exception as e:
-        print(f"Error getting returns for {sym}: {e}. Using zero returns.")
-        return pd.Series(0.0, index=raw.index)
-inputs_google = pd.DataFrame(index=raw.index, columns=[n for n in node_order[:11]], dtype=float)
-inputs_google['Large_Deficits'] = safe_series_google('^IRX') / 100.0
-inputs_google['Foreign_Demand'] = safe_return_google('UUP')
-inputs_google['Low_Unemployment'] = 0.5
-inputs_google['Supply_Increase'] = safe_return_google('XLI')
-inputs_google['Energy_Price_Increase'] = safe_return_google('XLE')
-inputs_google['Consumer_Demand'] = safe_return_google('XLY')
-inputs_google['Business_Investment'] = safe_return_google('XLI')
-inputs_google['Market_Volatility'] = safe_series_google('^VIX') / 50.0
-inputs_google['Equity_Inflows'] = safe_return_google('SPY')
-tech_returns_g = [safe_return_google(t) for t in tickers['AI_Technology']]
-inputs_google['AI_Technology'] = pd.concat(tech_returns_g, axis=1).mean(axis=1)
-inputs_google['News_Sentiment'] = inputs['News_Sentiment']  # same as yahoo
-inputs_norm_google = (inputs_google - inputs_google.min()) / (inputs_google.max() - inputs_google.min() + 1e-8)
-inputs_norm_google = inputs_norm_google.clip(0, 1).fillna(0.5)
-# Actual NASDAQ returns & normalized actual used as target
-actual_returns = returns['^IXIC'] if '^IXIC' in returns.columns else pd.Series(0.0, index=returns.index)
-actual_norm = (actual_returns - actual_returns.min()) / (actual_returns.max() - actual_returns.min() + 1e-8)
-# -------------------------
-# --- Weights dict from connections (static baseline)
-# -------------------------
-weights_dict = {}
-for x1, y1, x2, y2, weight, _ in connections:
-    src = pos_to_name.get((x1, y1))
-    tgt = pos_to_name.get((x2, y2))
-    if src and tgt:
-        weights_dict.setdefault(src, {})[tgt] = weight
-# -------------------------
-# --- Numeric helpers
-# -------------------------
-def sigmoid(x, c=2.0):
-    x = np.clip(np.asarray(x, dtype=float), -50, 50)
-    return 1.0 / (1.0 + np.exp(-c * x))
-def compute_state_from_outer(outer_series, wdict, node_order_local, max_iter=60, tol=1e-5):
-    # outer_series: pandas Series of the outer nodes (10)
-    state = {n: 0.5 for n in node_order_local}
-    for k in outer_series.index:
-        state[k] = float(outer_series[k])
-    inner_idx = ['Monetary_Policy', 'Inflation', 'Corporate_Earnings', 'Investor_Sentiment', 'NASDAQ']
-    for _ in range(max_iter):
-        prev_state = state.copy()
-        for tgt in inner_idx:
-            s = 0.0
-            for src in node_order_local:
-                s += wdict.get(src, {}).get(tgt, 0.0) * state[src]
-            state[tgt] = float(sigmoid(s, c=2.0))
-        if max(abs(prev_state[n] - state[n]) for n in inner_idx) < tol:
-            break
-    return state
-# -------------------------
-# --- Static activations (exact parity)
-# -------------------------
-activations = pd.DataFrame(index=inputs_norm.index, columns=node_order, dtype=float)
-activations.update(inputs_norm)
-print("Computing static activations...")
-for i in range(1, len(activations)):
-    prev_outer = inputs_norm.iloc[i-1]
-    state = compute_state_from_outer(prev_outer, weights_dict, node_order)
-    activations.loc[activations.index[i]] = pd.Series(state)
-activations['NASDAQ_pred'] = activations['NASDAQ']
-valid_idx = activations.index[1:]
-static_pred = activations['NASDAQ_pred'].loc[valid_idx]
-static_pred_norm = (static_pred - static_pred.min()) / (static_pred.max() - static_pred.min() + 1e-8)
-static_corr = static_pred_norm.corr(actual_norm.loc[valid_idx])
-static_mse = ((static_pred_norm - actual_norm.loc[valid_idx]) ** 2).mean()
-print(f"\nStatic FCM metrics (lagged): corr={static_corr:.4f}, normalized MSE={static_mse:.6f}")
-# -------------------------
-# --- Dynamic FCM (online updates)
-# -------------------------
-dynamic_weights = copy.deepcopy(weights_dict)
-learning_rate = 0.02
-weight_clip = 3.0
-dates = list(inputs_norm.index)
-n_steps = len(dates)
-max_frames = min(200, n_steps)
-skip = max(1, n_steps // max_frames)
-weights_history = []
-pred_history = []
-date_history = []
-print("Running online updates to build dynamic weight history...")
-for idx in range(1, n_steps):
-    date = dates[idx]
-    prev_date = dates[idx-1]
-    outer_prev = inputs_norm.loc[prev_date]
-    # compute state using current dynamic_weights (so updates affect future)
-    state = compute_state_from_outer(outer_prev, dynamic_weights, node_order)
-    pred = state['NASDAQ']
-    # target using normalized actual at current date (if exists)
-    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
-    error = target - pred
-    grad = pred * (1 - pred)
-    delta = error * grad
-    # update incoming NASDAQ weights only
-    for src in node_order:
-        if src in dynamic_weights and 'NASDAQ' in dynamic_weights[src]:
-            dynamic_weights[src]['NASDAQ'] += learning_rate * delta * state[src]
-            dynamic_weights[src]['NASDAQ'] = np.clip(dynamic_weights[src]['NASDAQ'], -weight_clip, weight_clip)
-    # Backpropagate to previous layer
-    direct_preds = [src for src in node_order if src in dynamic_weights and 'NASDAQ' in dynamic_weights[src] and dynamic_weights[src]['NASDAQ'] != 0]
-    for pred_name in direct_preds:
-        error_pred = delta * dynamic_weights[pred_name]['NASDAQ']
-        grad_pred = state[pred_name] * (1 - state[pred_name])
-        delta_pred = error_pred * grad_pred
-        for src in node_order:
-            if src in dynamic_weights and pred_name in dynamic_weights[src]:
-                dynamic_weights[src][pred_name] += learning_rate * delta_pred * state[src]
-                dynamic_weights[src][pred_name] = np.clip(dynamic_weights[src][pred_name], -weight_clip, weight_clip)
-    # snapshot
-    if (idx % skip) == 0 or idx == n_steps - 1:
-        weights_history.append(copy.deepcopy(dynamic_weights))
-        pred_history.append(pred)
-        date_history.append(date)
-# replay dynamic to produce dyn_series aligned for metrics
-dynamic_weights_replay = copy.deepcopy(weights_dict)
-dyn_series = pd.Series(index=inputs_norm.index, dtype=float)
-for idx in range(1, n_steps):
-    date = dates[idx]
-    prev_date = dates[idx-1]
-    state = compute_state_from_outer(inputs_norm.loc[prev_date], dynamic_weights_replay, node_order)
-    dyn_series.loc[date] = state['NASDAQ']
-    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
-    error = target - state['NASDAQ']
-    grad = state['NASDAQ'] * (1 - state['NASDAQ'])
-    delta = error * grad
-    for src in node_order:
-        if src in dynamic_weights_replay and 'NASDAQ' in dynamic_weights_replay[src]:
-            dynamic_weights_replay[src]['NASDAQ'] += learning_rate * delta * state[src]
-            dynamic_weights_replay[src]['NASDAQ'] = np.clip(dynamic_weights_replay[src]['NASDAQ'], -weight_clip, weight_clip)
-    direct_preds = [src for src in node_order if src in dynamic_weights_replay and 'NASDAQ' in dynamic_weights_replay[src] and dynamic_weights_replay[src]['NASDAQ'] != 0]
-    for pred_name in direct_preds:
-        error_pred = delta * dynamic_weights_replay[pred_name]['NASDAQ']
-        grad_pred = state[pred_name] * (1 - state[pred_name])
-        delta_pred = error_pred * grad_pred
-        for src in node_order:
-            if src in dynamic_weights_replay and pred_name in dynamic_weights_replay[src]:
-                dynamic_weights_replay[src][pred_name] += learning_rate * delta_pred * state[src]
-                dynamic_weights_replay[src][pred_name] = np.clip(dynamic_weights_replay[src][pred_name], -weight_clip, weight_clip)
-dyn_norm = (dyn_series - dyn_series.min()) / (dyn_series.max() - dyn_series.min() + 1e-8)
-valid_idx_dyn = dyn_norm.dropna().index.intersection(valid_idx)
-dynamic_corr = dyn_norm.loc[valid_idx_dyn].corr(actual_norm.loc[valid_idx_dyn])
-dynamic_mse = ((dyn_norm.loc[valid_idx_dyn] - actual_norm.loc[valid_idx_dyn]) ** 2).mean()
-print(f"Dynamic FCM Yahoo metrics (lagged): corr={dynamic_corr:.4f}, normalized MSE={dynamic_mse:.6f}")
-# NEW: Dynamic FCM for Google
-dynamic_weights_google = copy.deepcopy(weights_dict)
-weights_history_google = []
-pred_history_google = []
-date_history_google = []
-print("Running online updates to build dynamic Google weight history...")
-for idx in range(1, n_steps):
-    date = dates[idx]
-    prev_date = dates[idx-1]
-    outer_prev = inputs_norm_google.loc[prev_date]
-    state = compute_state_from_outer(outer_prev, dynamic_weights_google, node_order)
-    pred = state['NASDAQ']
-    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
-    error = target - pred
-    grad = pred * (1 - pred)
-    delta = error * grad
-    for src in node_order:
-        if src in dynamic_weights_google and 'NASDAQ' in dynamic_weights_google[src]:
-            dynamic_weights_google[src]['NASDAQ'] += learning_rate * delta * state[src]
-            dynamic_weights_google[src]['NASDAQ'] = np.clip(dynamic_weights_google[src]['NASDAQ'], -weight_clip, weight_clip)
-    direct_preds = [src for src in node_order if src in dynamic_weights_google and 'NASDAQ' in dynamic_weights_google[src] and dynamic_weights_google[src]['NASDAQ'] != 0]
-    for pred_name in direct_preds:
-        error_pred = delta * dynamic_weights_google[pred_name]['NASDAQ']
-        grad_pred = state[pred_name] * (1 - state[pred_name])
-        delta_pred = error_pred * grad_pred
-        for src in node_order:
-            if src in dynamic_weights_google and pred_name in dynamic_weights_google[src]:
-                dynamic_weights_google[src][pred_name] += learning_rate * delta_pred * state[src]
-                dynamic_weights_google[src][pred_name] = np.clip(dynamic_weights_google[src][pred_name], -weight_clip, weight_clip)
-    if (idx % skip) == 0 or idx == n_steps - 1:
-        weights_history_google.append(copy.deepcopy(dynamic_weights_google))
-        pred_history_google.append(pred)
-        date_history_google.append(date)
-# replay for Google
-dynamic_weights_replay_google = copy.deepcopy(weights_dict)
-dyn_series_google = pd.Series(index=inputs_norm_google.index, dtype=float)
-for idx in range(1, n_steps):
-    date = dates[idx]
-    prev_date = dates[idx-1]
-    state = compute_state_from_outer(inputs_norm_google.loc[prev_date], dynamic_weights_replay_google, node_order)
-    dyn_series_google.loc[date] = state['NASDAQ']
-    target = float(actual_norm.loc[date]) if date in actual_norm.index else 0.0
-    error = target - state['NASDAQ']
-    grad = state['NASDAQ'] * (1 - state['NASDAQ'])
-    delta = error * grad
-    for src in node_order:
-        if src in dynamic_weights_replay_google and 'NASDAQ' in dynamic_weights_replay_google[src]:
-            dynamic_weights_replay_google[src]['NASDAQ'] += learning_rate * delta * state[src]
-            dynamic_weights_replay_google[src]['NASDAQ'] = np.clip(dynamic_weights_replay_google[src]['NASDAQ'], -weight_clip, weight_clip)
-    direct_preds = [src for src in node_order if src in dynamic_weights_replay_google and 'NASDAQ' in dynamic_weights_replay_google[src] and dynamic_weights_replay_google[src]['NASDAQ'] != 0]
-    for pred_name in direct_preds:
-        error_pred = delta * dynamic_weights_replay_google[pred_name]['NASDAQ']
-        grad_pred = state[pred_name] * (1 - state[pred_name])
-        delta_pred = error_pred * grad_pred
-        for src in node_order:
-            if src in dynamic_weights_replay_google and pred_name in dynamic_weights_replay_google[src]:
-                dynamic_weights_replay_google[src][pred_name] += learning_rate * delta_pred * state[src]
-                dynamic_weights_replay_google[src][pred_name] = np.clip(dynamic_weights_replay_google[src][pred_name], -weight_clip, weight_clip)
-dyn_norm_google = (dyn_series_google - dyn_series_google.min()) / (dyn_series_google.max() - dyn_series_google.min() + 1e-8)
-valid_idx_dyn_google = dyn_norm_google.dropna().index.intersection(valid_idx)
-dynamic_corr_google = dyn_norm_google.loc[valid_idx_dyn_google].corr(actual_norm.loc[valid_idx_dyn_google])
-dynamic_mse_google = ((dyn_norm_google.loc[valid_idx_dyn_google] - actual_norm.loc[valid_idx_dyn_google]) ** 2).mean()
-print(f"Dynamic FCM Google metrics (lagged): corr={dynamic_corr_google:.4f}, normalized MSE={dynamic_mse_google:.6f}")
-# -------------------------
-# --- Prepare dynamic panel drawing utilities
-# -------------------------
-def draw_nodes_on_axis(ax):
-    for name, ticker, desc, x, y in outer_nodes:
-        box = mpatches.FancyBboxPatch((x-1.4, y-0.6), 2.8, 1.2,
-                                       boxstyle="round,pad=0.05",
-                                       facecolor='lightblue', edgecolor='black', linewidth=2)
-        ax.add_patch(box)
-        ax.text(x, y+0.2, name.replace('_', '\n'), ha='center', va='center', fontsize=8, fontweight='bold')
-        ax.text(x, y-0.35, f'{ticker}', ha='center', va='center', fontsize=7, color='darkblue')
-    for name, x, y in inner_nodes[:-1]:
-        circle = plt.Circle((x, y), 0.9, facecolor='lightyellow', edgecolor='black', linewidth=2)
-        ax.add_patch(circle)
-        ax.text(x, y, name.replace('_', '\n'), ha='center', va='center', fontsize=8, fontweight='bold')
-    circle = plt.Circle((15, 8.5), 1.1, facecolor='lightgreen', edgecolor='darkgreen', linewidth=3)
-    ax.add_patch(circle)
-    ax.text(15, 8.5, 'NASDAQ', ha='center', va='center', fontsize=12, fontweight='bold')
-def draw_arrows_dynamic(ax, wdict, annotate_weights=True):
-    # clear and redraw nodes
-    ax.cla()
-    ax.set_xlim(0, 20)
-    ax.set_ylim(0, 14)
-    ax.set_aspect('equal')
+
+# ===== End Constants =====
+
+def plot_sentiment_time_series(out):
+    """Plot sentiment time series from available sources with improved clarity."""
+    fig, axes = plt.subplots(2, 1, figsize=(16, 8))
+
+    # Top plot: Sentiment comparison
+    ax = axes[0]
+    actual_norm = out["actual_norm"]
+
+    if out["polarity_series_yahoo"] is not None:
+        # Dual source: Yahoo and Google
+        pol_yahoo = out["polarity_series_yahoo"].reindex(actual_norm.index).fillna(0.0)
+        pol_google = out["polarity_series_google"].reindex(actual_norm.index).fillna(0.0)
+
+        # Plot with consistent colors from palette
+        ax.plot(pol_yahoo.index, pol_yahoo.rolling(7, min_periods=1).mean(),
+                label='Yahoo News Sentiment (7d MA)', color=COLORS["yahoo_primary"], lw=2.5, alpha=0.8)
+        ax.plot(pol_google.index, pol_google.rolling(7, min_periods=1).mean(),
+                label='Google News Sentiment (7d MA)', color=COLORS["google_primary"], lw=2.5, alpha=0.8)
+
+        # Check for data availability
+        yahoo_data_pct = (pol_yahoo != 0).sum() / len(pol_yahoo) * 100 if len(pol_yahoo) > 0 else 0
+        google_data_pct = (pol_google != 0).sum() / len(pol_google) * 100 if len(pol_google) > 0 else 0
+
+        # Add data availability indicators
+        if yahoo_data_pct > 0:
+            ax.text(0.01, 0.95, f"✓ Yahoo Data: {yahoo_data_pct:.0f}% available",
+                   transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+        if google_data_pct > 0:
+            ax.text(0.01, 0.88, f"✓ Google Data: {google_data_pct:.0f}% available",
+                   transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.3))
+    else:
+        # Unified sentiment
+        pol = out["polarity_series"].reindex(actual_norm.index).fillna(0.0)
+        ax.plot(pol.index, pol.rolling(7, min_periods=1).mean(),
+                label='Unified News Sentiment (7d MA)', color=COLORS["yahoo_primary"], lw=2.5, alpha=0.8)
+
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.4, linewidth=1)
+    ax.set_ylabel("Sentiment Polarity [-1, 1]", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("News Sentiment Analysis (Yahoo vs Google)", fontsize=FONT_SIZES["title"], fontweight='bold')
+    ax.legend(loc='upper left', fontsize=FONT_SIZES["legend"], framealpha=0.95)
+    ax.grid(True, alpha=0.2)
+
+    # Bottom plot: Actual vs normalized
+    ax = axes[1]
+    ax.plot(actual_norm.index, actual_norm, label='Actual NASDAQ Returns (normalized)',
+            color=COLORS["actual"], lw=2.5, alpha=0.7)
+    ax.fill_between(actual_norm.index, actual_norm, alpha=0.15, color=COLORS["actual"])
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.4, linewidth=1)
+    ax.set_ylabel("Normalized Returns", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_xlabel("Date", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("Normalized NASDAQ Returns", fontsize=FONT_SIZES["title"], fontweight='bold')
+    ax.legend(loc='upper left', fontsize=FONT_SIZES["legend"], framealpha=0.95)
+    ax.grid(True, alpha=0.2)
+
+    # Improve date label readability
+    ax.tick_params(axis='x', rotation=45)
+    axes[0].tick_params(axis='x', rotation=45)
+
+    plt.tight_layout()
+    plt.savefig('sentiment_timeseries.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved sentiment_timeseries.png")
+    plt.show()
+
+
+def plot_model_predictions(out):
+    """Plot actual vs predicted NASDAQ comparing Yahoo and Google FCM models with metrics."""
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+    actual_norm = out["actual_norm"]
+
+    # Yahoo Dynamic FCM Predictions
+    ax = axes[0, 0]
+    dates_yahoo = out["date_history_yahoo"]
+    preds_yahoo = out["pred_history_yahoo"]
+    actual_subset = actual_norm.loc[actual_norm.index.isin(dates_yahoo)]
+    ax.plot(actual_norm.index, actual_norm, label='Actual NASDAQ', color=COLORS["actual"], lw=2.5, alpha=0.7)
+    ax.plot(dates_yahoo, preds_yahoo, label='Yahoo FCM Predictions', color=COLORS["yahoo_primary"], lw=2, alpha=0.9)
+    ax.fill_between(actual_norm.index, actual_norm, alpha=0.1, color=COLORS["actual"])
+
+    # Metric display for Yahoo
+    yahoo_corr = out['dynamic_corr_yahoo']
+    yahoo_mse = out['dynamic_mse_yahoo']
+    yahoo_corr_str = f"{yahoo_corr:.4f}" if not np.isnan(yahoo_corr) else "N/A"
+    yahoo_mse_str = f"{yahoo_mse:.2e}" if not np.isnan(yahoo_mse) and yahoo_mse != float('inf') else "N/A"
+    yahoo_avail = "✓" if (out['polarity_series_yahoo'] is not None) else "✗"
+
+    ax.set_title(f"Yahoo Data Source - Dynamic FCM Model\nCorr: {yahoo_corr_str}  |  MSE: {yahoo_mse_str}  {yahoo_avail}",
+                 fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    ax.set_ylabel("Normalized Value", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.legend(fontsize=FONT_SIZES["legend"], loc='best', framealpha=0.95)
+    ax.grid(True, alpha=0.2)
+    ax.tick_params(axis='x', rotation=45)
+
+    # Google Dynamic FCM Predictions
+    ax = axes[0, 1]
+    dates_google = out["date_history_google"]
+    preds_google = out["pred_history_google"]
+    ax.plot(actual_norm.index, actual_norm, label='Actual NASDAQ', color=COLORS["actual"], lw=2.5, alpha=0.7)
+    ax.plot(dates_google, preds_google, label='Google FCM Predictions', color=COLORS["google_primary"], lw=2, alpha=0.9)
+    ax.fill_between(actual_norm.index, actual_norm, alpha=0.1, color=COLORS["actual"])
+
+    # Metric display for Google
+    google_corr = out['dynamic_corr_google']
+    google_mse = out['dynamic_mse_google']
+    google_corr_str = f"{google_corr:.4f}" if not np.isnan(google_corr) else "N/A"
+    google_mse_str = f"{google_mse:.2e}" if not np.isnan(google_mse) and google_mse != float('inf') else "N/A"
+    google_avail = "✓" if (out['polarity_series_google'] is not None) else "✗"
+
+    ax.set_title(f"Google Data Source - Dynamic FCM Model\nCorr: {google_corr_str}  |  MSE: {google_mse_str}  {google_avail}",
+                 fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    ax.set_ylabel("Normalized Value", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.legend(fontsize=FONT_SIZES["legend"], loc='best', framealpha=0.95)
+    ax.grid(True, alpha=0.2)
+    ax.tick_params(axis='x', rotation=45)
+
+    # Model Comparison - Correlation
+    ax = axes[1, 0]
+    models = ['Static FCM', 'Yahoo FCM\n(Dynamic)', 'Google FCM\n(Dynamic)']
+    correlations = [out['static_corr'],
+                   out['dynamic_corr_yahoo'] if not np.isnan(out['dynamic_corr_yahoo']) else 0,
+                   out['dynamic_corr_google'] if not np.isnan(out['dynamic_corr_google']) else 0]
+    colors_bar = [COLORS["fcm_static"], COLORS["yahoo_primary"], COLORS["google_primary"]]
+    bars = ax.bar(models, correlations, color=colors_bar, alpha=0.75, edgecolor='black', linewidth=1.5, width=0.6)
+    ax.set_ylabel("Correlation with Actual", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("FCM Model Performance Comparison: Correlation", fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+    ax.grid(True, alpha=0.2, axis='y')
+    # Add value labels on bars
+    for bar, val in zip(bars, correlations):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{val:.4f}', ha='center', va='bottom', fontsize=FONT_SIZES["annotation"], fontweight='bold')
+
+    # Model Comparison - MSE
+    ax = axes[1, 1]
+    mses = [out['static_mse'],
+           out['dynamic_mse_yahoo'] if not np.isnan(out['dynamic_mse_yahoo']) and out['dynamic_mse_yahoo'] != float('inf') else 1.0,
+           out['dynamic_mse_google'] if not np.isnan(out['dynamic_mse_google']) and out['dynamic_mse_google'] != float('inf') else 1.0]
+    bars = ax.bar(models, mses, color=colors_bar, alpha=0.75, edgecolor='black', linewidth=1.5, width=0.6)
+    ax.set_ylabel("Mean Squared Error (log scale)", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("FCM Model Performance Comparison: MSE", fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    if any(m > 0 for m in mses):
+        ax.set_yscale('log')
+    ax.grid(True, alpha=0.2, axis='y')
+    # Add value labels on bars
+    for bar, val in zip(bars, mses):
+        height = bar.get_height()
+        val_str = f'{val:.2e}' if val > 0 else 'N/A'
+        ax.text(bar.get_x() + bar.get_width()/2., height * 1.15,
+                val_str, ha='center', va='bottom', fontsize=FONT_SIZES["annotation"], fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig('model_predictions.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved model_predictions.png")
+    plt.show()
+
+def plot_sentiment_vs_returns(out):
+    """Plot daily returns colored by sentiment."""
+    # Determine which sentiment data to use
+    polarity = None
+
+    if out["polarity_series_yahoo"] is not None and not out["polarity_series_yahoo"].empty:
+        polarity = out["polarity_series_yahoo"]
+        title_suffix = "(Yahoo Source)"
+    elif out["polarity_series_google"] is not None and not out["polarity_series_google"].empty:
+        polarity = out["polarity_series_google"]
+        title_suffix = "(Google Source)"
+    elif out["polarity_series"] is not None and not out["polarity_series"].empty:
+        polarity = out["polarity_series"]
+        title_suffix = ""
+    else:
+        logger.warning("No sentiment data available for scatter plot")
+        return
+
+    actual_returns = out["actual_returns"]
+    idx = polarity.index.intersection(actual_returns.index)
+
+    if len(idx) == 0:
+        logger.warning("No overlapping dates for sentiment vs returns plot")
+        return
+
+    pol = polarity.loc[idx]
+    ret = actual_returns.loc[idx]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    scatter = ax.scatter(idx, ret.values, c=pol.values, cmap='RdYlGn', vmin=-1, vmax=1,
+                        s=80, alpha=0.6, edgecolors='black', linewidth=0.5)
+
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label("Sentiment Polarity [-1, 1]", fontsize=10, fontweight='bold')
+
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+    ax.set_ylabel("Daily Return", fontsize=11, fontweight='bold')
+    ax.set_xlabel("Date", fontsize=11, fontweight='bold')
+    ax.set_title(f"Daily NASDAQ Returns Colored by News Sentiment {title_suffix}",
+                fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig('sentiment_vs_returns.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved sentiment_vs_returns.png")
+    plt.show()
+
+def plot_weight_evolution(out):
+    """Plot how key edge weights evolve over time during training."""
+    weights_history_yahoo = out["weights_history_yahoo"]
+    dates_yahoo = out["date_history_yahoo"]
+
+    if not weights_history_yahoo or len(weights_history_yahoo) == 0:
+        logger.warning("No weight history available")
+        return
+
+    # Extract weights to NASDAQ from a few key nodes
+    key_nodes = [n for n in out["node_order"] if n not in ['Monetary_Policy', 'Inflation', 'Corporate_Earnings', 'Investor_Sentiment', 'NASDAQ']][:5]
+
+    fig, ax = plt.subplots(figsize=(15, 7))
+
+    colors_list = plt.cm.tab20(np.linspace(0, 1, len(key_nodes)))
+
+    for node, color in zip(key_nodes, colors_list):
+        weights_to_nasdaq = []
+        for w_dict in weights_history_yahoo:
+            w = w_dict.get(node, {}).get('NASDAQ', 0.0)
+            weights_to_nasdaq.append(w)
+        ax.plot(range(len(weights_to_nasdaq)), weights_to_nasdaq, label=f'{node} → NASDAQ',
+               color=color, lw=2.5, alpha=0.85, marker='o', markersize=4, markevery=max(1, len(weights_to_nasdaq)//20))
+
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax.set_xlabel("Training Step", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_ylabel("Weight Value", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("FCM Weight Evolution During Training (Yahoo Source)", fontsize=FONT_SIZES["title"], fontweight='bold')
+    ax.legend(loc='best', fontsize=FONT_SIZES["legend"], ncol=2, framealpha=0.95)
+    ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig('weight_evolution.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved weight_evolution.png")
+    plt.show()
+
+def draw_fcm_graph(node_order, weights_snapshot, activations_snapshot=None, title="FCM Network"):
+    """Draw the FCM network graph with improved visualization."""
+    G = nx.DiGraph()
+
+    # Add nodes
+    for n in node_order:
+        G.add_node(n)
+
+    # Add edges from weights (only significant weights)
+    edge_weights = []
+    for src, targets in weights_snapshot.items():
+        for tgt, w in targets.items():
+            if abs(w) > 0.01:  # Filter small weights for clarity
+                G.add_edge(src, tgt, weight=w)
+                edge_weights.append((src, tgt, w))
+
+    fig, ax = plt.subplots(figsize=(16, 10))
+
+    # Layout: separate outer (input) nodes from inner nodes
+    inner_nodes = ['Monetary_Policy', 'Inflation', 'Corporate_Earnings', 'Investor_Sentiment', 'NASDAQ']
+    outer_nodes = [n for n in node_order if n not in inner_nodes]
+
+    pos = {}
+    # Place outer nodes in a circle on the left
+    n_outer = len(outer_nodes)
+    for i, node in enumerate(outer_nodes):
+        angle = 2 * np.pi * i / max(n_outer, 1)
+        pos[node] = (0 + np.cos(angle), np.sin(angle))
+
+    # Place inner nodes on the right
+    for i, node in enumerate(inner_nodes):
+        angle = 2 * np.pi * i / len(inner_nodes)
+        pos[node] = (3 + np.cos(angle), np.sin(angle))
+
+    # Node colors and sizes based on activation values
+    if activations_snapshot:
+        node_vals = [activations_snapshot.get(n, 0.5) for n in G.nodes()]
+    else:
+        node_vals = [0.5 for _ in G.nodes()]
+
+    sizes = [500 + 2000 * float(v) for v in node_vals]
+    colors = [plt.cm.cool(float(v)) for v in node_vals]
+
+    # Draw nodes
+    nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color=colors,
+                          edgecolors='black', linewidths=2, ax=ax)
+
+    # Draw edges with color indicating sign
+    if G.edges():
+        edge_widths = [4.0 * abs(d['weight']) / max([abs(e[2]) for e in edge_weights]) for _, _, d in G.edges(data=True)]
+        edge_colors = ['#2ca02c' if d['weight'] >= 0 else '#d62728' for _, _, d in G.edges(data=True)]
+
+        nx.draw_networkx_edges(G, pos, width=edge_widths, edge_color=edge_colors,
+                              arrowsize=25, arrowstyle='-|>', connectionstyle='arc3,rad=0.1',
+                              ax=ax, alpha=0.7)
+
+    # Labels
+    nx.draw_networkx_labels(G, pos, font_size=9, font_weight='bold', ax=ax)
+
+    # Legend
+    positive_patch = mpatches.Patch(color='#2ca02c', label='Positive weight')
+    negative_patch = mpatches.Patch(color='#d62728', label='Negative weight')
+    ax.legend(handles=[positive_patch, negative_patch], loc='upper left', fontsize=11)
+
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
     ax.axis('off')
-    draw_nodes_on_axis(ax)
-    for x1, y1, x2, y2, orig_w, _ in connections:
-        dx, dy = x2 - x1, y2 - y1
-        dist = np.sqrt(dx**2 + dy**2)
-        offset1 = 1.0 if x1 < 5 else 0.9
-        offset2 = 1.1 if (x2, y2) == (15, 8.5) else 0.9
-        start_x = x1 + (dx/dist) * offset1
-        start_y = y1 + (dy/dist) * offset1
-        end_x = x2 - (dx/dist) * offset2
-        end_y = y2 - (dy/dist) * offset2
-        src = pos_to_name.get((x1, y1))
-        tgt = pos_to_name.get((x2, y2))
-        w = orig_w
-        if src and tgt:
-            w = wdict.get(src, {}).get(tgt, orig_w)
-        color = 'green' if w >= 0 else 'red'
-        ax.annotate('', xy=(end_x, end_y), xytext=(start_x, start_y),
-                    arrowprops=dict(arrowstyle='->', color=color, lw=max(0.5, abs(w)*3.0), alpha=0.85))
-        if annotate_weights:
-            mid_x, mid_y = (start_x + end_x) / 2, (start_y + end_y) / 2
-            ax.text(mid_x, mid_y, f'{w:.2f}', fontsize=8, ha='center', va='center',
-                    bbox=dict(boxstyle='round', facecolor='white', edgecolor=color, alpha=0.9))
-    return ax
-# initialize dynamic panel with first snapshot (or baseline)
-initial_weights = weights_history[0] if weights_history else weights_dict
-draw_arrows_dynamic(ax_dyn_yahoo, initial_weights)
-ax_dyn_yahoo.text(10, 13.2, 'Dynamic FCM Yahoo (weights update over time)', ha='center', fontsize=12, fontweight='bold')
-# NEW: Initialize Google dynamic panel
-initial_weights_google = weights_history_google[0] if weights_history_google else weights_dict
-draw_arrows_dynamic(ax_dyn_google, initial_weights_google)
-ax_dyn_google.text(10, 13.2, 'Dynamic FCM Google (weights update over time)', ha='center', fontsize=12, fontweight='bold')
-# -------------------------
-# --- Animation function
-# -------------------------
-def update_frame(idx):
-    wdict = weights_history[idx]
-    date = date_history[idx] if idx < len(date_history) else None
-    draw_arrows_dynamic(ax_dyn_yahoo, wdict, annotate_weights=True)
-    txt = f"Dynamic Yahoo weights snapshot\nDate: {date.strftime('%Y-%m-%d') if date is not None else 'N/A'}"
-    ax_dyn_yahoo.text(10, 13.2, txt, ha='center', fontsize=12, fontweight='bold')
-    # NEW: Update Google panel
-    wdict_g = weights_history_google[idx]
-    draw_arrows_dynamic(ax_dyn_google, wdict_g, annotate_weights=True)
-    txt_g = f"Dynamic Google weights snapshot\nDate: {date.strftime('%Y-%m-%d') if date is not None else 'N/A'}"
-    ax_dyn_google.text(10, 13.2, txt_g, ha='center', fontsize=12, fontweight='bold')
-# NEW: Use min frames for both histories
-frames = min(len(weights_history), len(weights_history_google))
-if frames == 0:
-    print("No dynamic weight history produced; skipping animation.")
-else:
-    ani = FuncAnimation(fig, update_frame, frames=frames, interval=300, repeat=False)
-# -------------------------
-# --- Final console outputs + show
-# -------------------------
-print("\nFINAL METRICS:")
-print(f"Static FCM corr: {static_corr:.4f}, static MSE: {static_mse:.6f}")
-print(f"Dynamic Yahoo FCM corr: {dynamic_corr:.4f}, dynamic MSE: {dynamic_mse:.6f}")
-print(f"Dynamic Google FCM corr: {dynamic_corr_google:.4f}, dynamic MSE: {dynamic_mse_google:.6f}")
-final_w = weights_history[-1] if weights_history else weights_dict
-print("\nFinal incoming NASDAQ weights (dynamic Yahoo snapshot):")
-for src in node_order:
-    if src in final_w and 'NASDAQ' in final_w[src]:
-        print(f"{src:25s} -> NASDAQ : {final_w[src]['NASDAQ']:.4f}")
-# NEW: Print final Google weights
-final_w_g = weights_history_google[-1] if weights_history_google else weights_dict
-print("\nFinal incoming NASDAQ weights (dynamic Google snapshot):")
-for src in node_order:
-    if src in final_w_g and 'NASDAQ' in final_w_g[src]:
-        print(f"{src:25s} -> NASDAQ : {final_w_g[src]['NASDAQ']:.4f}")
-plt.tight_layout()
-plt.show()
+
+    plt.tight_layout()
+    return fig
+
+def plot_feature_importance(out):
+    """Plot feature importance (correlation with target) with improved readability."""
+    feature_importance = out["feature_importance"]
+
+    fig, ax = plt.subplots(figsize=(13, 9))
+
+    # Sort by importance
+    feature_importance_sorted = feature_importance.sort_values(ascending=True)
+    colors = [COLORS["actual"] if x > 0 else COLORS["prediction"] for x in feature_importance_sorted.values]
+
+    bars = ax.barh(range(len(feature_importance_sorted)), feature_importance_sorted.values,
+                   color=colors, alpha=0.75, edgecolor='black', linewidth=1.2)
+    ax.set_yticks(range(len(feature_importance_sorted)))
+    ax.set_yticklabels(feature_importance_sorted.index, fontsize=FONT_SIZES["label"])
+    ax.set_xlabel("Absolute Correlation with NASDAQ Returns", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("Feature Importance: How Each Node Influences NASDAQ Predictions",
+                fontsize=FONT_SIZES["title"], fontweight='bold')
+    ax.grid(True, alpha=0.2, axis='x')
+    ax.axvline(0, color='black', linestyle='-', linewidth=0.8)
+
+    # Add value labels on bars
+    for idx, (bar, val) in enumerate(zip(bars, feature_importance_sorted.values)):
+        width = bar.get_width()
+        ax.text(width + 0.01, bar.get_y() + bar.get_height()/2.,
+               f'{val:.3f}', ha='left', va='center', fontsize=FONT_SIZES["small"])
+
+    plt.tight_layout()
+    plt.savefig('feature_importance.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved feature_importance.png")
+    plt.show()
+
+def plot_historical_node_flow(out):
+    """
+    Create historical node-flow visualization showing how nodes' correlations
+    to NASDAQ evolved from Jan 2024 to Jan 2026.
+
+    2-panel layout:
+    Panel 1: Heatmap of node correlations over time
+    Panel 2: Time series of 4 key nodes + NASDAQ returns
+    """
+    correlations_history = out["correlations_history_yahoo"]
+    inputs_norm = out["inputs_norm_yahoo"]
+    actual_norm = out["actual_norm"]
+
+    if not correlations_history or len(correlations_history) < 2:
+        logger.warning("Insufficient historical correlation data for node-flow visualization")
+        return
+
+    # Extract dates and build correlation matrix over time
+    dates_list = sorted(list(correlations_history.keys()))
+    node_names = list(correlations_history[dates_list[0]].index)
+
+    # Create 2D array: rows=nodes, columns=dates
+    corr_matrix = np.zeros((len(node_names), len(dates_list)))
+    for date_idx, date in enumerate(dates_list):
+        corr_series = correlations_history[date]
+        for node_idx, node in enumerate(node_names):
+            if node in corr_series.index:
+                corr_matrix[node_idx, date_idx] = corr_series[node]
+
+    # Create figure with 2 panels
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.2, 1], hspace=0.3)
+
+    # ===== PANEL 1: Node Correlation Evolution Heatmap =====
+    ax1 = fig.add_subplot(gs[0])
+
+    # Use seaborn for better heatmap
+    im = ax1.imshow(corr_matrix, cmap='RdBu_r', aspect='auto', vmin=-1, vmax=1, interpolation='nearest')
+
+    # Set ticks
+    ax1.set_yticks(range(len(node_names)))
+    ax1.set_yticklabels(node_names, fontsize=FONT_SIZES["label"])
+
+    # Thin out x-axis labels to avoid crowding
+    x_ticks = np.linspace(0, len(dates_list)-1, min(15, len(dates_list)), dtype=int)
+    ax1.set_xticks(x_ticks)
+    x_labels = [dates_list[i].strftime('%Y-%m-%d') for i in x_ticks]
+    ax1.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=9)
+
+    # Labels
+    ax1.set_xlabel("Date", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax1.set_ylabel("Nodes", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax1.set_title("Historical Node Influence Evolution: How Each Node's Correlation to NASDAQ Changed Over Time (Jan 2024 - Jan 2026)",
+                 fontsize=FONT_SIZES["title"], fontweight='bold', pad=15)
+
+    # Colorbar
+    cbar1 = plt.colorbar(im, ax=ax1, pad=0.02, label='Correlation to NASDAQ')
+    cbar1.set_label('Correlation Strength', fontsize=FONT_SIZES["label"], fontweight='bold')
+
+    # ===== PANEL 2: Key Nodes Time Series + NASDAQ =====
+    ax2 = fig.add_subplot(gs[1])
+
+    # Select 4 key nodes if they exist
+    key_nodes = ['Inflation', 'Low_Unemployment', 'Oil_Prices', 'Tech_News_Sentiment']
+    # Filter to only nodes that actually exist
+    available_key_nodes = [n for n in key_nodes if n in node_names]
+    if not available_key_nodes:
+        # Fall back to first 4 nodes
+        available_key_nodes = node_names[:4]
+
+    colors_panel2 = [COLORS["yahoo_primary"], COLORS["google_primary"],
+                      COLORS["prediction"], COLORS["lstm"]]
+
+    # Plot NASDAQ on secondary y-axis
+    ax2_twin = ax2.twinx()
+    line_nasdaq = ax2_twin.plot(actual_norm.index, actual_norm,
+                                 label='NASDAQ Returns (normalized)',
+                                 color=COLORS["actual"], lw=3, alpha=0.7, zorder=10)
+    ax2_twin.set_ylabel("NASDAQ Normalized Returns", fontsize=FONT_SIZES["label"], fontweight='bold', color=COLORS["actual"])
+    ax2_twin.tick_params(axis='y', labelcolor=COLORS["actual"])
+    ax2_twin.grid(True, alpha=0.1)
+
+    # Plot key nodes
+    for node_idx, (node, color) in enumerate(zip(available_key_nodes, colors_panel2)):
+        if node in inputs_norm.columns:
+            node_data = inputs_norm[node]
+            ax2.plot(node_data.index, node_data, label=f'{node} (normalized)',
+                    color=color, lw=2, alpha=0.8, marker='o', markersize=2, markevery=max(1, len(node_data)//30))
+
+    ax2.set_xlabel("Date", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax2.set_ylabel("Node Values (normalized)", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax2.set_title("Key Node Values Over Time vs NASDAQ (Jan 2024 - Jan 2026)",
+                 fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    ax2.grid(True, alpha=0.2)
+    ax2.tick_params(axis='x', rotation=45)
+
+    # Combined legend
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2_twin.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left',
+              fontsize=FONT_SIZES["legend"], framealpha=0.95)
+
+    plt.savefig('historical_node_flow.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved historical_node_flow.png")
+    plt.show()
+
+def plot_correlation_heatmap_snapshots(out):
+    """Plot historical correlation snapshots over time."""
+    correlations_history = out["correlations_history_yahoo"]
+
+    if not correlations_history or len(correlations_history) < 2:
+        logger.warning("Insufficient correlation history data")
+        return
+
+    # Select 4 snapshots for visualization (beginning, 1/3, 2/3, end)
+    snapshot_dates = sorted(list(correlations_history.keys()))
+    indices = [0, len(snapshot_dates)//3, 2*len(snapshot_dates)//3, -1]
+    selected_dates = [snapshot_dates[i] for i in indices]
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+
+    for idx, date in enumerate(selected_dates):
+        corr_series = correlations_history[date]
+
+        ax = axes[idx]
+        colors = ['#2ca02c' if x > 0 else '#d62728' for x in corr_series.values]
+        ax.barh(range(len(corr_series)), corr_series.values, color=colors, alpha=0.7, edgecolor='black')
+        ax.set_yticks(range(len(corr_series)))
+        ax.set_yticklabels(corr_series.index, fontsize=9)
+        ax.set_xlabel("Correlation", fontsize=10, fontweight='bold')
+        ax.axvline(0, color='black', linestyle='-', linewidth=0.8)
+        ax.set_title(f"Node Correlations with Target\n{date.strftime('%Y-%m-%d')}", fontsize=11, fontweight='bold')
+        ax.grid(True, alpha=0.2, axis='x')
+        ax.set_xlim(-1, 1)
+
+    plt.suptitle("Historical Correlation Evolution: How Nodes Influence NASDAQ Over Time",
+                 fontsize=14, fontweight='bold', y=1.00)
+    plt.tight_layout()
+    plt.savefig('correlation_snapshots.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved correlation_snapshots.png")
+    plt.show()
+
+def plot_lstm_comparison(out):
+    """Plot comprehensive 5-model performance comparison: LSTM, GRU, Yahoo FCM, Google FCM, Ensemble."""
+    lstm_metrics = out.get("lstm_metrics", {})
+    gru_metrics = out.get("gru_metrics", {})
+    metrics_comparison = out.get("metrics_comparison", {})
+
+    if not lstm_metrics or all(v == 0 for v in lstm_metrics.values()):
+        logger.warning("Deep learning metrics not available")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+    # ===== Panel 1: Test MAE Comparison (5 models) =====
+    ax = axes[0, 0]
+    model_names = ['LSTM', 'GRU', 'Yahoo\nFCM', 'Google\nFCM', 'Ensemble']
+    test_maes = [
+        lstm_metrics.get('test_mae', 0),
+        gru_metrics.get('test_mae', 0),
+        abs(out.get('dynamic_corr_yahoo', 0)),
+        abs(out.get('dynamic_corr_google', 0)),
+        0  # Placeholder for ensemble
+    ]
+    colors_models = [COLORS["lstm"], COLORS["gru"], COLORS["yahoo_primary"], COLORS["google_primary"], COLORS["ensemble"]]
+    bars = ax.bar(model_names, test_maes, color=colors_models, alpha=0.75, edgecolor='black', linewidth=1.5, width=0.6)
+    ax.set_ylabel("Mean Absolute Error", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("Test Set MAE: Neural Networks vs FCM Models", fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    ax.grid(True, alpha=0.2, axis='y')
+    for bar, val in zip(bars, test_maes):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + 0.005,
+               f'{val:.4f}', ha='center', va='bottom', fontsize=FONT_SIZES["annotation"], fontweight='bold')
+
+    # ===== Panel 2: Test MSE Comparison (5 models) =====
+    ax = axes[0, 1]
+    test_mses = [
+        lstm_metrics.get('test_mse', 0),
+        gru_metrics.get('test_mse', 0),
+        out.get('dynamic_mse_yahoo', 0),
+        out.get('dynamic_mse_google', 0),
+        0  # Placeholder for ensemble
+    ]
+    bars = ax.bar(model_names, test_mses, color=colors_models, alpha=0.75, edgecolor='black', linewidth=1.5, width=0.6)
+    ax.set_ylabel("Mean Squared Error", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("Test Set MSE: Neural Networks vs FCM Models", fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    if any(m > 0 for m in test_mses):
+        ax.set_yscale('log')
+    ax.grid(True, alpha=0.2, axis='y')
+    for bar, val in zip(bars, test_mses):
+        height = bar.get_height()
+        val_str = f'{val:.2e}' if val > 0 else '0'
+        ax.text(bar.get_x() + bar.get_width()/2., height * 1.2 if height > 0 else 0.01,
+               val_str, ha='center', va='bottom', fontsize=FONT_SIZES["annotation"], fontweight='bold')
+
+    # ===== Panel 3: LSTM Deep Learning Metrics =====
+    ax = axes[1, 0]
+    lstm_metric_names = ['Train\nMAE', 'Test\nMAE', 'Train\nMSE', 'Test\nMSE', 'Test\nR²']
+    lstm_metric_values = [
+        lstm_metrics.get('train_mae', 0),
+        lstm_metrics.get('test_mae', 0),
+        lstm_metrics.get('train_mse', 0),
+        lstm_metrics.get('test_mse', 0),
+        lstm_metrics.get('test_r2', 0)
+    ]
+    colors_lstm = [COLORS["lstm"], COLORS["lstm"], COLORS["lstm"], COLORS["lstm"], COLORS["lstm"]]
+    bars = ax.bar(lstm_metric_names, lstm_metric_values, color=colors_lstm, alpha=0.75, edgecolor='black', linewidth=1.5, width=0.6)
+    ax.set_ylabel("Metric Value", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("LSTM Deep Learning Model: Complete Metrics", fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    ax.grid(True, alpha=0.2, axis='y')
+    for bar, val in zip(bars, lstm_metric_values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + 0.005,
+               f'{val:.4f}', ha='center', va='bottom', fontsize=FONT_SIZES["annotation"], fontweight='bold')
+
+    # ===== Panel 4: GRU Deep Learning Metrics =====
+    ax = axes[1, 1]
+    gru_metric_names = ['Train\nMAE', 'Test\nMAE', 'Train\nMSE', 'Test\nMSE', 'Test\nR²']
+    gru_metric_values = [
+        gru_metrics.get('train_mae', 0),
+        gru_metrics.get('test_mae', 0),
+        gru_metrics.get('train_mse', 0),
+        gru_metrics.get('test_mse', 0),
+        gru_metrics.get('test_r2', 0)
+    ]
+    colors_gru = [COLORS["gru"], COLORS["gru"], COLORS["gru"], COLORS["gru"], COLORS["gru"]]
+    bars = ax.bar(gru_metric_names, gru_metric_values, color=colors_gru, alpha=0.75, edgecolor='black', linewidth=1.5, width=0.6)
+    ax.set_ylabel("Metric Value", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("GRU Deep Learning Model: Complete Metrics", fontsize=FONT_SIZES["subtitle"], fontweight='bold')
+    ax.grid(True, alpha=0.2, axis='y')
+    for bar, val in zip(bars, gru_metric_values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + 0.005,
+               f'{val:.4f}', ha='center', va='bottom', fontsize=FONT_SIZES["annotation"], fontweight='bold')
+
+    plt.suptitle("Comprehensive Model Comparison: 5-Model Analysis", fontsize=FONT_SIZES["title"], fontweight='bold', y=0.995)
+    plt.tight_layout()
+    plt.savefig('lstm_comparison.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved lstm_comparison.png")
+    plt.show()
+
+
+def plot_ensemble_comparison(out):
+    """Compare predictions from Yahoo FCM, Google FCM, LSTM, GRU, and Ensemble models."""
+    fig, ax = plt.subplots(figsize=(18, 7))
+
+    actual_norm = out["actual_norm"]
+    dates_yahoo = out["date_history_yahoo"]
+
+    # Plot actual NASDAQ (thick black line, highest z-order)
+    ax.plot(actual_norm.index, actual_norm, label='Actual NASDAQ (normalized)',
+           color=COLORS["actual"], lw=3, alpha=0.9, zorder=10)
+
+    # Dynamic FCM Yahoo predictions
+    ax.plot(dates_yahoo, out["pred_history_yahoo"], label='Dynamic FCM (Yahoo Source)',
+           color=COLORS["yahoo_primary"], lw=2, alpha=0.7, linestyle='--', zorder=7)
+
+    # Dynamic FCM Google predictions
+    dates_google = out["date_history_google"]
+    ax.plot(dates_google, out["pred_history_google"], label='Dynamic FCM (Google Source)',
+           color=COLORS["google_primary"], lw=2, alpha=0.7, linestyle='--', zorder=7)
+
+    # Ensemble predictions (if available)
+    ensemble_pred = out.get("ensemble_predictions")
+    if ensemble_pred is not None and len(ensemble_pred) > 0:
+        # Align ensemble predictions with actual timeline
+        ensemble_dates = actual_norm.index[-len(ensemble_pred):]
+        ax.plot(ensemble_dates, ensemble_pred, label='Ensemble Predictions (LSTM+GRU+FCM)',
+               color=COLORS["ensemble"], lw=2.5, alpha=0.85, linestyle='-', zorder=8, marker='o', markersize=3, markevery=5)
+
+    ax.axhline(0, color='gray', linestyle=':', alpha=0.4, linewidth=1)
+    ax.set_xlabel("Date", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_ylabel("Normalized NASDAQ Returns", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("Multi-Model Ensemble Comparison: Yahoo vs Google FCM + Deep Learning",
+                fontsize=FONT_SIZES["title"], fontweight='bold')
+    ax.legend(loc='best', fontsize=FONT_SIZES["legend"], framealpha=0.96, ncol=2)
+    ax.grid(True, alpha=0.2)
+    ax.tick_params(axis='x', rotation=45)
+
+    # Add ensemble accuracy metrics if available
+    if ensemble_pred is not None and len(ensemble_pred) > 0:
+        ensemble_corr = out.get("metrics_comparison", {}).get("Ensemble", {}).get("corr", 0)
+        ensemble_mse = out.get("metrics_comparison", {}).get("Ensemble", {}).get("mse", 0)
+        metrics_text = f"Ensemble Accuracy: Corr={ensemble_corr:.4f}, MSE={ensemble_mse:.2e}"
+        ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes, fontsize=10,
+               verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+    plt.savefig('ensemble_comparison.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved ensemble_comparison.png")
+    plt.show()
+
+
+def plot_node_interaction_heatmap(out):
+    """Create a heatmap showing final node-to-node interactions from weight matrix with debugging."""
+    weights_final = out["weights_history_yahoo"][-1] if out["weights_history_yahoo"] else out["weights_init"]
+    node_order = out["node_order"]
+
+    # Build correlation matrix from weights
+    n_nodes = len(node_order)
+    weight_matrix = np.zeros((n_nodes, n_nodes))
+
+    # Debug: Count non-zero weights
+    non_zero_count = 0
+    for i, src in enumerate(node_order):
+        if src in weights_final:
+            for j, tgt in enumerate(node_order):
+                if tgt in weights_final[src]:
+                    w = weights_final[src][tgt]
+                    weight_matrix[i, j] = w
+                    if abs(w) > 1e-6:
+                        non_zero_count += 1
+
+    logger.info(f"Node interaction heatmap: {non_zero_count} non-zero weights out of {n_nodes**2} total")
+
+    fig, ax = plt.subplots(figsize=(16, 14))
+
+    # Use better colormap and ensure proper normalization
+    im = ax.imshow(weight_matrix, cmap='RdBu_r', aspect='auto', vmin=-1, vmax=1)
+
+    ax.set_xticks(range(n_nodes))
+    ax.set_yticks(range(n_nodes))
+    ax.set_xticklabels(node_order, rotation=45, ha='right', fontsize=10, fontweight='bold')
+    ax.set_yticklabels(node_order, fontsize=10, fontweight='bold')
+
+    ax.set_xlabel("Target Node (influences →)", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_ylabel("Source Node (← influences from)", fontsize=FONT_SIZES["label"], fontweight='bold')
+    ax.set_title("FCM Final Weight Matrix: Node-to-Node Influence Strength", fontsize=FONT_SIZES["title"], fontweight='bold')
+
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Weight Value [-1 to +1]", fontsize=FONT_SIZES["label"], fontweight='bold')
+
+    # Add text annotations with better threshold (show more weights)
+    for i in range(n_nodes):
+        for j in range(n_nodes):
+            w = weight_matrix[i, j]
+            # Show all weights ≥ 0.02 or all weights that are non-zero
+            if abs(w) >= 0.02:
+                # Color text based on background
+                text_color = 'white' if abs(w) > 0.5 else 'black'
+                ax.text(j, i, f'{w:.3f}',
+                       ha="center", va="center", color=text_color,
+                       fontsize=FONT_SIZES["annotation"], fontweight='bold')
+
+    # Add grid for clarity
+    ax.set_xticks(np.arange(n_nodes) - 0.5, minor=True)
+    ax.set_yticks(np.arange(n_nodes) - 0.5, minor=True)
+    ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+
+    # Add summary statistics
+    max_weight = np.max(np.abs(weight_matrix))
+    mean_weight = np.mean(np.abs(weight_matrix[weight_matrix != 0])) if non_zero_count > 0 else 0
+    summary_text = f"Max Weight: {max_weight:.4f}  |  Mean Weight (non-zero): {mean_weight:.4f}"
+    ax.text(0.5, -0.08, summary_text, transform=ax.transAxes,
+           ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+    plt.savefig('node_interaction_heatmap.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved node_interaction_heatmap.png")
+    plt.show()
+
+
+def plot_individual_stock_prices(out):
+    """Plot individual stock prices with sentiment overlay."""
+    price_df = out["price_df_yahoo"]
+    polarity = out.get("polarity_series")
+
+    if polarity is None or polarity.empty:
+        polarity = pd.Series(0, index=price_df.index)
+
+    # Select major stocks
+    major_stocks = ['NVDA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'SPY', '^VIX', '^IXIC']
+    available_stocks = [s for s in major_stocks if s in price_df.columns]
+
+    if not available_stocks:
+        logger.warning("No major stocks found in price data")
+        return
+
+    # Create grid: 2 rows, 4 columns
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes = axes.flatten()
+
+    for idx, stock in enumerate(available_stocks):
+        ax = axes[idx]
+
+        # Normalize price for comparison (0-1 scale)
+        price = price_df[stock]
+        price_norm = (price - price.min()) / (price.max() - price.min() + 1e-8)
+
+        # Reindex sentiment to match price dates
+        sent_aligned = polarity.reindex(price.index).fillna(0)
+
+        # Plot price
+        ax.plot(price.index, price_norm, label='Normalized Price', color='#1f77b4', lw=2.5, alpha=0.8)
+
+        # Add sentiment as filled area
+        ax.fill_between(price.index, 0, (sent_aligned + 1) / 2, alpha=0.2, color='#ff7f0e', label='Sentiment (scaled)')
+
+        ax.set_ylabel("Normalized Price", fontsize=10, fontweight='bold')
+        ax.set_title(f"{stock} - Price & Sentiment", fontsize=11, fontweight='bold')
+        ax.legend(fontsize=8, loc='upper left')
+        ax.grid(True, alpha=0.2)
+        ax.set_ylim(-0.1, 1.1)
+
+    plt.suptitle("Individual Stock Prices with News Sentiment Overlay",
+                 fontsize=14, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    plt.savefig('stock_prices_sentiment.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved stock_prices_sentiment.png")
+    plt.show()
+
+def plot_stock_correlation_matrix(out):
+    """Plot correlation matrix between stocks."""
+    price_df = out["price_df_yahoo"]
+
+    # Calculate returns
+    returns = price_df.pct_change().dropna()
+
+    # Keep major stocks only
+    major_stocks = ['NVDA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'SPY', 'XLY', 'XLI', '^VIX', '^IXIC']
+    available = [s for s in major_stocks if s in returns.columns]
+
+    if len(available) < 2:
+        logger.warning("Insufficient stocks for correlation analysis")
+        return
+
+    corr_matrix = returns[available].corr()
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    im = ax.imshow(corr_matrix, cmap='RdBu_r', aspect='auto', vmin=-1, vmax=1)
+
+    ax.set_xticks(range(len(available)))
+    ax.set_yticks(range(len(available)))
+    ax.set_xticklabels(available, rotation=45, ha='right', fontsize=10, fontweight='bold')
+    ax.set_yticklabels(available, fontsize=10, fontweight='bold')
+
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Correlation Coefficient", fontsize=11, fontweight='bold')
+
+    # Add text annotations
+    for i in range(len(available)):
+        for j in range(len(available)):
+            val = corr_matrix.iloc[i, j]
+            color = 'white' if abs(val) > 0.5 else 'black'
+            ax.text(j, i, f'{val:.2f}', ha="center", va="center",
+                   color=color, fontsize=9, fontweight='bold')
+
+    ax.set_title("Stock Return Correlations", fontsize=13, fontweight='bold', pad=20)
+    plt.tight_layout()
+    plt.savefig('stock_correlation_matrix.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved stock_correlation_matrix.png")
+    plt.show()
+
+def plot_stock_sentiment_impact(out):
+    """Show sentiment correlation with individual stocks."""
+    price_df = out["price_df_yahoo"]
+    polarity = out.get("polarity_series")
+
+    if polarity is None or polarity.empty:
+        logger.warning("No sentiment data for impact analysis")
+        return
+
+    # Calculate returns and correlate with sentiment
+    returns = price_df.pct_change()
+
+    major_stocks = ['NVDA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'SPY', 'XLY', 'XLI', '^VIX', '^IXIC']
+    available = [s for s in major_stocks if s in returns.columns]
+
+    correlations = []
+    for stock in available:
+        common_idx = returns[stock].index.intersection(polarity.index)
+        if len(common_idx) > 10:
+            corr = returns[stock].loc[common_idx].corr(polarity.loc[common_idx])
+            correlations.append((stock, corr if not np.isnan(corr) else 0))
+
+    if not correlations:
+        logger.warning("Could not compute sentiment correlations")
+        return
+
+    stocks, corrs = zip(*sorted(correlations, key=lambda x: x[1]))
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    colors = ['#2ca02c' if c > 0 else '#d62728' for c in corrs]
+    bars = ax.barh(range(len(stocks)), corrs, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+
+    ax.set_yticks(range(len(stocks)))
+    ax.set_yticklabels(stocks, fontsize=11, fontweight='bold')
+    ax.set_xlabel("Correlation with News Sentiment", fontsize=11, fontweight='bold')
+    ax.set_title("Stock Sensitivity to News Sentiment", fontsize=13, fontweight='bold')
+    ax.axvline(0, color='black', linestyle='-', linewidth=1)
+    ax.grid(True, alpha=0.2, axis='x')
+
+    # Add value labels
+    for bar, val in zip(bars, corrs):
+        width = bar.get_width()
+        ax.text(width, bar.get_y() + bar.get_height()/2.,
+               f' {val:.3f}', ha='left' if val > 0 else 'right', va='center',
+               fontsize=9, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig('stock_sentiment_impact.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved stock_sentiment_impact.png")
+    plt.show()
+
+def plot_stock_predictions_comparison(out):
+    """Compare actual vs predicted for key stocks."""
+    price_df_yahoo = out["price_df_yahoo"]
+    actual_norm = out["actual_norm"]
+    dates_yahoo = out["date_history_yahoo"]
+    preds_yahoo = np.array(out["pred_history_yahoo"])
+
+    # Key stocks
+    key_stocks = ['NVDA', 'AAPL', 'MSFT', 'AMZN']
+    available = [s for s in key_stocks if s in price_df_yahoo.columns]
+
+    if not available:
+        logger.warning("No stocks available for prediction comparison")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    axes = axes.flatten()
+
+    for idx, stock in enumerate(available):
+        ax = axes[idx]
+
+        # Get stock returns
+        stock_price = price_df_yahoo[stock]
+        stock_returns = stock_price.pct_change().fillna(0)
+
+        # Normalize
+        stock_norm = (stock_returns - stock_returns.min()) / (stock_returns.max() - stock_returns.min() + 1e-8)
+        stock_norm = stock_norm.clip(-5, 5)
+
+        # Plot actual returns
+        ax.plot(stock_price.index, stock_norm, label='Actual Returns (normalized)',
+               color='#2ca02c', lw=2, alpha=0.7)
+
+        # Plot FCM predictions (scaled to stock range)
+        dates_common = [d for d in dates_yahoo if d in stock_price.index]
+        if dates_common:
+            preds_subset = preds_yahoo[:len(dates_common)]
+            ax.plot(dates_common, preds_subset, label='FCM Predictions',
+                   color='#d62728', lw=1.5, alpha=0.7, linestyle='--')
+
+        ax.set_ylabel("Normalized Returns", fontsize=10, fontweight='bold')
+        ax.set_title(f"{stock} - Actual vs FCM Predictions", fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.2)
+
+    plt.suptitle("Individual Stock Returns vs FCM Predictions Comparison",
+                fontsize=13, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    plt.savefig('stock_predictions_comparison.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved stock_predictions_comparison.png")
+    plt.show()
+
+def plot_cumulative_returns_comparison(out):
+    """Compare cumulative returns: stocks, NASDAQ, and FCM model."""
+    price_df = out["price_df_yahoo"]
+    actual_norm = out["actual_norm"]
+    dates_yahoo = out["date_history_yahoo"]
+    preds_yahoo = out["pred_history_yahoo"]
+
+    # Key sectors
+    sector_stocks = {
+        'Tech (NVDA+AAPL+MSFT)': ['NVDA', 'AAPL', 'MSFT'],
+        'Cloud (GOOGL+AMZN)': ['GOOGL', 'AMZN'],
+        'Market (SPY)': ['SPY'],
+        'NASDAQ': ['^IXIC']
+    }
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    for sector_name, stocks in sector_stocks.items():
+        available = [s for s in stocks if s in price_df.columns]
+        if not available:
+            continue
+
+        # Calculate cumulative returns
+        prices = price_df[available]
+        returns = prices.pct_change().fillna(0)
+        cum_returns = (1 + returns).prod(axis=1).cumprod()
+
+        ax.plot(cum_returns.index, cum_returns, label=sector_name, lw=2.5, alpha=0.8)
+
+    # Add FCM predictions (cumulative)
+    cum_fcm = (1 + np.array(preds_yahoo) / 100).cumprod()
+    ax.plot(dates_yahoo, cum_fcm, label='FCM Predictions (scaled)',
+           color='#d62728', lw=2, alpha=0.7, linestyle='--')
+
+    ax.set_xlabel("Date", fontsize=11, fontweight='bold')
+    ax.set_ylabel("Cumulative Return Factor", fontsize=11, fontweight='bold')
+    ax.set_title("Sector Cumulative Returns vs FCM Model Predictions", fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig('cumulative_returns_comparison.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved cumulative_returns_comparison.png")
+    plt.show()
+
+def plot_stock_volatility_sentiment(out):
+    """Show relationship between stock volatility and sentiment."""
+    price_df = out["price_df_yahoo"]
+    polarity = out.get("polarity_series")
+
+    if polarity is None or polarity.empty:
+        logger.warning("No sentiment data for volatility analysis")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    axes = axes.flatten()
+
+    major_stocks = ['NVDA', 'AAPL', 'MSFT', 'AMZN']
+
+    for idx, stock in enumerate(major_stocks):
+        if stock not in price_df.columns:
+            continue
+
+        ax = axes[idx]
+
+        # Calculate rolling volatility
+        returns = price_df[stock].pct_change()
+        volatility = returns.rolling(window=20).std() * np.sqrt(252)  # Annualized
+
+        # Align with sentiment
+        common_idx = volatility.index.intersection(polarity.index)
+        vol_aligned = volatility.loc[common_idx]
+        sent_aligned = polarity.loc[common_idx]
+
+        # Scatter plot
+        scatter = ax.scatter(sent_aligned.values, vol_aligned.values,
+                           c=range(len(sent_aligned)), cmap='viridis',
+                           s=100, alpha=0.6, edgecolors='black', linewidth=0.5)
+
+        # Add trend line
+        if len(sent_aligned) > 10:
+            z = np.polyfit(sent_aligned.values, vol_aligned.values, 1)
+            p = np.poly1d(z)
+            x_trend = np.linspace(sent_aligned.min(), sent_aligned.max(), 100)
+            ax.plot(x_trend, p(x_trend), "r--", lw=2, alpha=0.8, label=f'Trend')
+
+        ax.set_xlabel("Sentiment Polarity", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Annualized Volatility", fontsize=10, fontweight='bold')
+        ax.set_title(f"{stock} - Volatility vs Sentiment", fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.2)
+
+    plt.suptitle("Stock Volatility Relationship with News Sentiment",
+                fontsize=13, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    plt.savefig('stock_volatility_sentiment.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved stock_volatility_sentiment.png")
+    plt.show()
+
+def plot_residual_analysis(out):
+    """Analyze and plot prediction errors (residuals)."""
+    actual_norm = out["actual_norm"]
+    dates_yahoo = out["date_history_yahoo"]
+    preds_yahoo = np.array(out["pred_history_yahoo"])  # Convert to numpy array
+
+    actual_subset = actual_norm.loc[actual_norm.index.isin(dates_yahoo)]
+    residuals = actual_subset.values - preds_yahoo
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Residuals over time
+    ax = axes[0, 0]
+    ax.scatter(dates_yahoo, residuals, alpha=0.6, color='#d62728', edgecolors='black', linewidth=0.5)
+    ax.axhline(0, color='black', linestyle='--', lw=2)
+    ax.set_ylabel("Residual (Actual - Predicted)", fontsize=10, fontweight='bold')
+    ax.set_title("Residuals Over Time", fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.2)
+
+    # Residual histogram
+    ax = axes[0, 1]
+    ax.hist(residuals, bins=30, color='#ff7f0e', alpha=0.7, edgecolor='black')
+    ax.axvline(np.mean(residuals), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(residuals):.4f}')
+    ax.axvline(np.median(residuals), color='green', linestyle='--', lw=2, label=f'Median: {np.median(residuals):.4f}')
+    ax.set_xlabel("Residual Value", fontsize=10, fontweight='bold')
+    ax.set_ylabel("Frequency", fontsize=10, fontweight='bold')
+    ax.set_title("Residual Distribution", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.2, axis='y')
+
+    # Predicted vs Actual
+    ax = axes[1, 0]
+    ax.scatter(actual_subset.values, preds_yahoo, alpha=0.6, color='#1f77b4', edgecolors='black', linewidth=0.5)
+    min_val = min(actual_subset.min(), np.min(preds_yahoo))
+    max_val = max(actual_subset.max(), np.max(preds_yahoo))
+    ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+    ax.set_xlabel("Actual Normalized Returns", fontsize=10, fontweight='bold')
+    ax.set_ylabel("Predicted Normalized Returns", fontsize=10, fontweight='bold')
+    ax.set_title("Predicted vs Actual", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.2)
+
+    # Q-Q plot for normality
+    ax = axes[1, 1]
+    from scipy import stats
+    stats.probplot(residuals, dist="norm", plot=ax)
+    ax.set_title("Q-Q Plot: Residual Normality", fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.2)
+
+    plt.suptitle("Residual Analysis: FCM Dynamic Model (Yahoo Source)",
+                fontsize=13, fontweight='bold', y=1.00)
+    plt.tight_layout()
+    plt.savefig('residual_analysis.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved residual_analysis.png")
+    plt.show()
+
+def main():
+    """Run all visualizations."""
+    logger.info("Running FCM analysis and generating visualizations...")
+    out = prepare_data_and_run()
+
+    # Basic visualizations
+    logger.info("Generating sentiment time series plot...")
+    plot_sentiment_time_series(out)
+
+    logger.info("Generating model predictions plot...")
+    plot_model_predictions(out)
+
+    logger.info("Generating sentiment vs returns plot...")
+    plot_sentiment_vs_returns(out)
+
+    logger.info("Generating weight evolution plot...")
+    plot_weight_evolution(out)
+
+    # FCM network
+    logger.info("Generating FCM network visualization...")
+    if out["weights_history_yahoo"]:
+        last_weights = out["weights_history_yahoo"][-1]
+    else:
+        last_weights = out["weights_init"]
+
+    idx = out["inputs_norm_yahoo"].index[-1]
+    last_outer = out["inputs_norm_yahoo"].loc[idx]
+    activ = compute_state_from_outer(last_outer, last_weights, out["node_order"])
+    fig = draw_fcm_graph(out["node_order"], last_weights, activations_snapshot=activ,
+                        title="FCM Network - Final State (Yahoo Source)")
+    plt.savefig('fcm_network.png', dpi=150, bbox_inches='tight')
+    logger.info("Saved fcm_network.png")
+    plt.show()
+
+    # Advanced visualizations
+    logger.info("Generating feature importance plot...")
+    plot_feature_importance(out)
+
+    logger.info("Generating historical node-flow visualization...")
+    plot_historical_node_flow(out)
+
+    logger.info("Generating historical correlation snapshots...")
+    plot_correlation_heatmap_snapshots(out)
+
+    logger.info("Generating node interaction heatmap...")
+    plot_node_interaction_heatmap(out)
+
+    logger.info("Generating LSTM deep learning comparison...")
+    plot_lstm_comparison(out)
+
+    logger.info("Generating ensemble model comparison...")
+    plot_ensemble_comparison(out)
+
+    logger.info("Generating residual analysis...")
+    plot_residual_analysis(out)
+
+    # Stock-level visualizations
+    logger.info("Generating individual stock prices plot...")
+    plot_individual_stock_prices(out)
+
+    logger.info("Generating stock correlation matrix...")
+    plot_stock_correlation_matrix(out)
+
+    logger.info("Generating stock sentiment impact plot...")
+    plot_stock_sentiment_impact(out)
+
+    logger.info("Generating stock predictions comparison...")
+    plot_stock_predictions_comparison(out)
+
+    logger.info("Generating cumulative returns comparison...")
+    plot_cumulative_returns_comparison(out)
+
+    logger.info("Generating stock volatility sentiment plot...")
+    plot_stock_volatility_sentiment(out)
+
+    logger.info("All visualizations completed!")
+
+if __name__ == "__main__":
+    main()
