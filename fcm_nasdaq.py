@@ -44,6 +44,73 @@ logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=loggi
 logger = logging.getLogger("fcm_nasdaq")
 
 # -----------------------
+# FRED API for Economic Data
+# -----------------------
+FRED_API_KEY = os.getenv("FRED_API_KEY", None)
+HAS_FRED = bool(FRED_API_KEY)
+
+def fetch_unemployment_data_fred(start_date, end_date):
+    """
+    Fetch unemployment rate data from FRED (Federal Reserve Economic Data).
+    Series: UNRATE (monthly) or similar
+    Returns: pandas Series indexed by date with unemployment rate
+    """
+    if not HAS_FRED:
+        logger.warning("FRED_API_KEY not found in environment; unemployment will be constant 0.5")
+        idx = pd.date_range(start=start_date, end=end_date, freq='B')
+        return pd.Series(0.5, index=idx)
+
+    try:
+        # Use FRED API to fetch unemployment rate (UNRATE)
+        url = "https://api.stlouisfed.org/fred/series/data"
+        params = {
+            "series_id": "UNRATE",
+            "api_key": FRED_API_KEY,
+            "file_type": "json"
+        }
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            logger.warning("FRED API returned %d; using constant unemployment", r.status_code)
+            idx = pd.date_range(start=start_date, end=end_date, freq='B')
+            return pd.Series(0.5, index=idx)
+
+        payload = r.json()
+        obs = payload.get("observations", [])
+
+        unemployment_dict = {}
+        for o in obs:
+            date_str = o.get("date")
+            value = o.get("value")
+            if date_str and value and value != ".":
+                try:
+                    date = pd.to_datetime(date_str)
+                    unemployment_dict[date] = float(value)
+                except:
+                    continue
+
+        if not unemployment_dict:
+            logger.warning("No unemployment data from FRED; using constant 0.5")
+            idx = pd.date_range(start=start_date, end=end_date, freq='B')
+            return pd.Series(0.5, index=idx)
+
+        # Create series and ffill for daily data
+        unemployment_series = pd.Series(unemployment_dict).sort_index()
+        unemployment_series = unemployment_series / 100.0  # normalize to [0, 1] range
+        unemployment_series = unemployment_series.clip(0, 1)
+
+        # Reindex to daily and forward fill
+        idx = pd.date_range(start=start_date, end=end_date, freq='B')
+        unemployment_series = unemployment_series.reindex(idx, method='ffill')
+
+        logger.info(f"Fetched unemployment data from FRED: {len(unemployment_dict)} observations")
+        return unemployment_series
+
+    except Exception as e:
+        logger.exception(f"FRED fetch error: {e}; using constant unemployment")
+        idx = pd.date_range(start=start_date, end=end_date, freq='B')
+        return pd.Series(0.5, index=idx)
+
+# -----------------------
 # Configuration (editable)
 # -----------------------
 CONFIG = {
@@ -436,21 +503,36 @@ def aggregate_daily_sentiment(articles, pos_set, neg_set, date_shift_days=1, dec
 # -----------------------
 # Build input proxies dynamically
 # -----------------------
-def build_proxies_from_prices(price_df, node_ticker_map, target_index):
+def build_proxies_from_prices(price_df, node_ticker_map, target_index, start_date=None, end_date=None):
     """
     price_df: DataFrame with Adj Close columns for tickers
     node_ticker_map: mapping node-> list of tickers (possibly empty)
+    start_date, end_date: for FRED unemployment data fetching
     Returns: inputs DataFrame (outer nodes) and returns Series for target.
     - For nodes with multiple tickers, we aggregate by mean returns.
-    - Low_Unemployment (no ticker) returned as constant 0.5
+    - Low_Unemployment: fetch from FRED if available, else constant 0.5
     """
     # compute returns (daily pct change)
     returns = price_df.pct_change().fillna(0)
     inputs = {}
+
+    # Fetch unemployment data if available
+    unemployment_data = None
+    if start_date and end_date and HAS_FRED:
+        unemployment_data = fetch_unemployment_data_fred(start_date, end_date)
+
     for node, tickers in node_ticker_map.items():
         if not tickers:
-            # no proxy available -> constant (for now)
-            inputs[node] = pd.Series(0.5, index=price_df.index)
+            # no proxy available
+            if node == "Low_Unemployment" and unemployment_data is not None:
+                # Use FRED unemployment data
+                inputs[node] = unemployment_data.reindex(price_df.index).fillna(method='ffill').fillna(0.5)
+                logger.info(f"Using FRED unemployment data for {node}")
+            else:
+                # Fall back to constant
+                inputs[node] = pd.Series(0.5, index=price_df.index)
+                if node == "Low_Unemployment":
+                    logger.info(f"FRED unemployment not available; using constant 0.5 for {node}")
             continue
         # for multi-ticker nodes compute mean returns series
         available = [t for t in tickers if t in price_df.columns]
@@ -827,8 +909,8 @@ def prepare_data_and_run(config_override=None):
     price_df_yahoo = fetch_prices_yfinance(tickers, start, end)
     price_df_google = fetch_prices_google(tickers, start, end)
     # build proxies inputs
-    inputs_df_yahoo, target_yahoo = build_proxies_from_prices(price_df_yahoo, conf["node_ticker_map"], conf["target_ticker"])
-    inputs_df_google, target_google = build_proxies_from_prices(price_df_google, conf["node_ticker_map"], conf["target_ticker"])
+    inputs_df_yahoo, target_yahoo = build_proxies_from_prices(price_df_yahoo, conf["node_ticker_map"], conf["target_ticker"], start_date=start, end_date=end)
+    inputs_df_google, target_google = build_proxies_from_prices(price_df_google, conf["node_ticker_map"], conf["target_ticker"], start_date=start, end_date=end)
     # load lexicon
     pos_set, neg_set = load_loughran_lexicon()
     # fetch news: try source-specific with NewsAPI if available, else Polygon unified
