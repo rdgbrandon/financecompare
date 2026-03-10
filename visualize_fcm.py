@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-visualize_fcm.py
-
-Comprehensive visualization suite for the dynamic FCM and sentiment analysis.
-All data is fetched dynamically through API calls - no static data or constants.
-Primary visual: Animated FCM Structure with real node values and weight evolution.
-"""
 import os
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
