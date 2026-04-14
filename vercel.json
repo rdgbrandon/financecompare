@@ -1,0 +1,12 @@
+{
+  "functions": {
+    "api/simulate.py": {
+      "runtime": "python3.9",
+      "maxDuration": 30
+    }
+  },
+  "routes": [
+    { "src": "/api/simulate", "dest": "/api/simulate.py" },
+    { "src": "/(.*)",         "dest": "/index.html" }
+  ]
+}

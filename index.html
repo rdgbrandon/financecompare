@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>FCM Nasdaq Simulator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#020b18;color:#c8e6ff;font-family:'Segoe UI',monospace;overflow:hidden;height:100vh}
+.glow{text-shadow:0 0 8px #00d4ff,0 0 20px #00d4ff}
+.panel{background:rgba(0,20,50,.75);border:1px solid rgba(0,180,255,.25);border-radius:10px;backdrop-filter:blur(6px)}
+#app{display:grid;grid-template-rows:54px 1fr 110px;height:100vh}
+
+/* header */
+#header{display:flex;align-items:center;padding:0 20px;gap:16px;
+        border-bottom:1px solid rgba(0,180,255,.3);background:rgba(0,10,30,.9)}
+#header h1{font-size:1.25rem;letter-spacing:3px;color:#00d4ff;text-transform:uppercase}
+#header .badge{font-size:.7rem;padding:3px 10px;border:1px solid #00d4ff44;border-radius:20px;color:#7dd3fc}
+#tabs{display:flex;gap:6px;margin-left:auto}
+.tab{padding:6px 14px;border:1px solid rgba(0,180,255,.3);border-radius:6px;cursor:pointer;
+     font-size:.75rem;letter-spacing:1px;transition:all .2s;color:#7dd3fc}
+.tab:hover,.tab.active{background:rgba(0,180,255,.2);border-color:#00d4ff;color:#fff;
+                        box-shadow:0 0 12px #00d4ff55}
+
+/* main */
+#main{display:grid;grid-template-columns:1fr 340px;gap:0;overflow:hidden}
+#canvas-wrap{position:relative;overflow:hidden}
+canvas{display:block}
+
+/* side panel */
+#side{display:flex;flex-direction:column;gap:10px;padding:12px;overflow-y:auto;
+      border-left:1px solid rgba(0,180,255,.2)}
+#acc-ring-wrap{text-align:center;padding:8px 0}
+#acc-title{font-size:.65rem;letter-spacing:2px;color:#7dd3fc;margin-bottom:4px}
+#acc-ring{position:relative;display:inline-block}
+#acc-ring canvas{display:block}
+#acc-num{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+         font-size:1.6rem;font-weight:700;color:#00d4ff}
+#acc-label{position:absolute;top:62%;left:50%;transform:translateX(-50%);
+           font-size:.6rem;color:#7dd3fc;white-space:nowrap}
+#day-card{padding:10px 12px}
+.dc-date{font-size:.65rem;color:#7dd3fc;letter-spacing:2px;margin-bottom:6px}
+.dc-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.dc-label{font-size:.7rem;color:#7dd3fc}
+.dc-val{font-size:.85rem;font-weight:600}
+.up{color:#4ade80}.down{color:#f87171}.neutral{color:#7dd3fc}
+.correct-badge{text-align:center;padding:5px;border-radius:6px;font-size:.75rem;font-weight:700;letter-spacing:1px}
+.correct-badge.ok{background:rgba(74,222,128,.15);border:1px solid #4ade80;color:#4ade80}
+.correct-badge.bad{background:rgba(248,113,113,.15);border:1px solid #f87171;color:#f87171}
+#nodes-list{padding:8px 12px;max-height:160px;overflow-y:auto}
+#nodes-list h3{font-size:.6rem;letter-spacing:2px;color:#7dd3fc;margin-bottom:6px}
+.node-row{display:flex;justify-content:space-between;align-items:center;
+          padding:3px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.node-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;flex-shrink:0}
+.node-name{font-size:.68rem;flex:1}
+.node-bar-wrap{width:60px;background:rgba(255,255,255,.08);border-radius:3px;height:5px;margin:0 6px}
+.node-bar{height:5px;border-radius:3px;transition:width .4s}
+.node-val{font-size:.65rem;width:38px;text-align:right}
+#chart-wrap{padding:8px 12px}
+#chart-wrap h3{font-size:.6rem;letter-spacing:2px;color:#7dd3fc;margin-bottom:4px}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#00d4ff44;border-radius:2px}
+
+/* footer */
+#footer{display:flex;align-items:center;gap:12px;padding:0 16px;
+        border-top:1px solid rgba(0,180,255,.2);background:rgba(0,10,30,.9)}
+#day-info{font-size:.75rem;color:#7dd3fc;min-width:180px}
+#day-info b{color:#fff}
+#slider-wrap{flex:1;display:flex;align-items:center;gap:8px}
+#day-slider{flex:1;-webkit-appearance:none;height:4px;border-radius:2px;
+            background:rgba(0,180,255,.3);outline:none;cursor:pointer}
+#day-slider::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;
+  border-radius:50%;background:#00d4ff;box-shadow:0 0 8px #00d4ff}
+.ctrl-btn{padding:5px 14px;border:1px solid rgba(0,180,255,.4);border-radius:6px;
+          background:transparent;color:#7dd3fc;cursor:pointer;font-size:.75rem;letter-spacing:1px;transition:all .2s}
+.ctrl-btn:hover{background:rgba(0,180,255,.15);color:#fff}
+.ctrl-btn.play{border-color:#4ade80;color:#4ade80}
+.ctrl-btn.play:hover{background:rgba(74,222,128,.15)}
+#streak{font-size:.7rem;color:#7dd3fc}
+
+/* loading overlay */
+#loading{position:fixed;inset:0;background:#020b18;display:flex;flex-direction:column;
+         align-items:center;justify-content:center;z-index:9999;gap:20px}
+#loading h2{font-size:1.1rem;letter-spacing:4px;color:#00d4ff}
+#loading p{font-size:.8rem;color:#7dd3fc}
+.spinner{width:50px;height:50px;border:3px solid rgba(0,180,255,.15);
+         border-top-color:#00d4ff;border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#load-steps{font-size:.72rem;color:#4ecdc4;text-align:center;line-height:1.8}
+#error-overlay{position:fixed;inset:0;background:#020b18;display:none;flex-direction:column;
+               align-items:center;justify-content:center;z-index:9999;gap:16px}
+#error-overlay h2{color:#f87171;letter-spacing:2px}
+#error-overlay p{color:#7dd3fc;font-size:.85rem;max-width:400px;text-align:center}
+</style>
+</head>
+<body>
+
+<!-- Loading screen -->
+<div id="loading">
+  <div class="spinner"></div>
+  <h2 class="glow">FCM NASDAQ SIMULATOR</h2>
+  <p>Fetching live market data from Yahoo Finance…</p>
+  <div id="load-steps"></div>
+</div>
+
+<!-- Error screen -->
+<div id="error-overlay">
+  <h2>DATA FETCH ERROR</h2>
+  <p id="error-msg"></p>
+  <button class="ctrl-btn" onclick="location.reload()">RETRY</button>
+</div>
+
+<!-- Main app (hidden until data loads) -->
+<div id="app" style="display:none">
+  <div id="header">
+    <h1 class="glow">FCM NASDAQ SIMULATOR</h1>
+    <span class="badge" id="date-range-badge"></span>
+    <div id="tabs">
+      <div class="tab active" data-fcm="0">AI-Backed</div>
+      <div class="tab" data-fcm="1">Research</div>
+      <div class="tab" data-fcm="2">3-Layer</div>
+      <div class="tab" data-fcm="3">Stock-Based</div>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="canvas-wrap">
+      <canvas id="three-canvas"></canvas>
+    </div>
+    <div id="side">
+      <div class="panel" id="acc-ring-wrap">
+        <div id="acc-title">TREND ACCURACY</div>
+        <div id="acc-ring">
+          <canvas id="ring-canvas" width="130" height="130"></canvas>
+          <div id="acc-num">--%</div>
+          <div id="acc-label">correct predictions</div>
+        </div>
+      </div>
+      <div class="panel" id="day-card">
+        <div class="dc-date" id="dc-date">–</div>
+        <div class="dc-row"><span class="dc-label">FCM PREDICTION</span><span class="dc-val" id="dc-pred">–</span></div>
+        <div class="dc-row"><span class="dc-label">ACTUAL NASDAQ</span><span class="dc-val" id="dc-actual">–</span></div>
+        <div class="dc-row"><span class="dc-label">CLOSE</span><span class="dc-val" id="dc-close">–</span></div>
+        <div class="correct-badge" id="dc-badge">–</div>
+      </div>
+      <div class="panel" id="nodes-list">
+        <h3>NODE ACTIVATIONS</h3>
+        <div id="node-rows"></div>
+      </div>
+      <div class="panel" id="chart-wrap">
+        <h3>DAILY RESULTS (LAST 30 DAYS)</h3>
+        <canvas id="mini-chart" height="80"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div id="footer">
+    <div id="day-info">Day <b id="fi-day">1</b> / <b id="fi-total">30</b></div>
+    <div id="slider-wrap">
+      <button class="ctrl-btn" id="btn-prev">◀</button>
+      <input type="range" id="day-slider" min="0" value="0"/>
+      <button class="ctrl-btn" id="btn-next">▶</button>
+    </div>
+    <button class="ctrl-btn play" id="btn-play">▶  PLAY</button>
+    <div id="streak"></div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// BOOT: fetch live data, then initialise
+// ═══════════════════════════════════════════════════════════════════
+let FCMS, SIMDATA, META;
+
+function setLoadStep(msg) {
+  document.getElementById('load-steps').textContent = msg;
+}
+
+async function boot() {
+  try {
+    setLoadStep('Connecting to data API…');
+    const res = await fetch('/api/simulate');
+    if (!res.ok) throw new Error(`API returned ${res.status}`);
+    setLoadStep('Parsing simulation results…');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    FCMS    = data.fcms;
+    SIMDATA = data.simdata;
+    META    = data.meta;
+    setLoadStep('Rendering 3D visualization…');
+    await new Promise(r => setTimeout(r, 100)); // let the DOM breathe
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('app').style.display = 'grid';
+    initApp();
+  } catch (err) {
+    document.getElementById('loading').style.display = 'none';
+    const eo = document.getElementById('error-overlay');
+    eo.style.display = 'flex';
+    document.getElementById('error-msg').textContent = err.message;
+  }
+}
+boot();
+
+// ═══════════════════════════════════════════════════════════════════
+// THREE.JS SETUP
+// ═══════════════════════════════════════════════════════════════════
+function initApp() {
+  const wrap   = document.getElementById('canvas-wrap');
+  const canvas = document.getElementById('three-canvas');
+  const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+  renderer.setPixelRatio(window.devicePixelRatio);
+  const scene  = new THREE.Scene();
+  scene.background = new THREE.Color(0x020b18);
+  scene.fog = new THREE.FogExp2(0x020b18, 0.04);
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 200);
+
+  let spherical = {theta:0, phi:Math.PI/3, r:10};
+  function applyCamera() {
+    camera.position.set(
+      spherical.r*Math.sin(spherical.phi)*Math.sin(spherical.theta),
+      spherical.r*Math.cos(spherical.phi),
+      spherical.r*Math.sin(spherical.phi)*Math.cos(spherical.theta)
+    );
+    camera.lookAt(0,0,0);
+  }
+  applyCamera();
+
+  let isDragging=false, prevMouse={x:0,y:0};
+  canvas.addEventListener('mousedown', e=>{isDragging=true;prevMouse={x:e.clientX,y:e.clientY}});
+  window.addEventListener('mouseup',   ()=>isDragging=false);
+  window.addEventListener('mousemove', e=>{
+    if(!isDragging) return;
+    spherical.theta -= (e.clientX-prevMouse.x)*0.005;
+    spherical.phi    = Math.max(0.2,Math.min(Math.PI-0.2,spherical.phi-(e.clientY-prevMouse.y)*0.005));
+    prevMouse={x:e.clientX,y:e.clientY};
+    applyCamera();
+  });
+  canvas.addEventListener('wheel', e=>{
+    spherical.r = Math.max(4,Math.min(25,spherical.r+e.deltaY*0.01));
+    applyCamera();
+  });
+
+  scene.add(new THREE.AmbientLight(0x112244, 1.5));
+  const pLight = new THREE.PointLight(0x00d4ff, 2, 30);
+  pLight.position.set(0,5,0); scene.add(pLight);
+  const grid = new THREE.GridHelper(20,20,0x0a2040,0x0a2040);
+  grid.position.y=-3; scene.add(grid);
+
+  // Particles
+  (()=>{
+    const geo=new THREE.BufferGeometry(), pts=[];
+    for(let i=0;i<600;i++) pts.push((Math.random()-.5)*30,(Math.random()-.5)*20,(Math.random()-.5)*30);
+    geo.setAttribute('position',new THREE.Float32BufferAttribute(pts,3));
+    scene.add(new THREE.Points(geo,new THREE.PointsMaterial({color:0x1a4a7a,size:0.06})));
+  })();
+
+  // ── Graph state ──────────────────────────────────────────────────
+  let graphGroup=null, nodeObjects={}, edgeObjects=[];
+  let activeFCM=0, dayIdx=0, playing=false;
+
+  function makeLabel(text, color='#fff', small=false) {
+    const sz=small?200:280;
+    const c=document.createElement('canvas');
+    c.width=sz; c.height=small?60:80;
+    const cx=c.getContext('2d');
+    if(!small){cx.fillStyle='rgba(2,11,24,0.7)';cx.beginPath();cx.roundRect(4,4,sz-8,c.height-8,8);cx.fill();}
+    cx.fillStyle=color; cx.font=`${small?18:20}px monospace`;
+    cx.textAlign='center'; cx.textBaseline='middle';
+    cx.fillText(text,sz/2,c.height/2);
+    const tex=new THREE.CanvasTexture(c);
+    const spr=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,depthWrite:false}));
+    const sc=small?.6:1.0;
+    spr.scale.set(sz/c.height*sc,sc,1);
+    return spr;
+  }
+
+  function buildGraph(fcmIdx) {
+    if(graphGroup) scene.remove(graphGroup);
+    graphGroup=new THREE.Group(); nodeObjects={}; edgeObjects=[];
+    const fcm=FCMS[fcmIdx];
+    const nodeMap={};
+    fcm.nodes.forEach(n=>nodeMap[n.id]=n);
+
+    fcm.nodes.forEach(nd=>{
+      const pos=new THREE.Vector3(nd.x,nd.y,nd.z);
+      const col=new THREE.Color(nd.color);
+      const r=nd.target?.0.38:.28;
+      const mesh=new THREE.Mesh(
+        new THREE.SphereGeometry(r,24,24),
+        new THREE.MeshPhongMaterial({color:col,emissive:col,emissiveIntensity:.4,transparent:true,opacity:.9})
+      );
+      mesh.position.copy(pos); graphGroup.add(mesh);
+      const ring=new THREE.Mesh(
+        new THREE.RingGeometry(r+.05,r+.15,32),
+        new THREE.MeshBasicMaterial({color:col,side:THREE.DoubleSide,transparent:true,opacity:.3})
+      );
+      ring.position.copy(pos); graphGroup.add(ring);
+      const label=makeLabel(nd.label,nd.color);
+      label.position.set(pos.x,pos.y+r+.4,pos.z); graphGroup.add(label);
+      nodeObjects[nd.id]={mesh,ring,baseColor:col,pos};
+    });
+
+    fcm.edges.forEach(edge=>{
+      const from=nodeMap[edge.from], to=nodeMap[edge.to];
+      if(!from||!to) return;
+      const pA=new THREE.Vector3(from.x,from.y,from.z);
+      const pB=new THREE.Vector3(to.x,to.y,to.z);
+      const mid=pA.clone().lerp(pB,.5).addScalar(.2);
+      const pts=new THREE.QuadraticBezierCurve3(pA,mid,pB).getPoints(24);
+      const col=new THREE.Color(edge.weight>=0?0x4ade80:0xf87171);
+      const line=new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(pts),
+        new THREE.LineBasicMaterial({color:col,transparent:true,opacity:Math.min(1,Math.abs(edge.weight)*.9+.15)})
+      );
+      graphGroup.add(line);
+      const dir=pB.clone().sub(pA).normalize();
+      const arrow=new THREE.Mesh(
+        new THREE.ConeGeometry(.06,.2,8),
+        new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:.7})
+      );
+      arrow.position.copy(pA.clone().lerp(pB,.88));
+      arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),dir);
+      graphGroup.add(arrow);
+      const wl=makeLabel(edge.weight.toFixed(2),edge.weight>=0?'#4ade80':'#f87171',true);
+      wl.position.copy(pA.clone().lerp(pB,.5)); wl.position.y+=.18;
+      graphGroup.add(wl);
+    });
+    scene.add(graphGroup);
+  }
+
+  function updateNodeVisuals(simRow) {
+    if(!simRow) return;
+    const vals=simRow.nodeValues;
+    Object.entries(nodeObjects).forEach(([nid,obj])=>{
+      const v=vals[nid]??0, intensity=Math.abs(v);
+      obj.mesh.material.emissiveIntensity=.3+intensity*.9;
+      obj.mesh.scale.setScalar(1+intensity*.3);
+      obj.ring.material.opacity=.15+intensity*.5;
+      if(v<-.1) obj.mesh.material.emissive.setHex(0xff3355);
+      else if(v>.1) obj.mesh.material.emissive.copy(obj.baseColor);
+      else obj.mesh.material.emissive.setHex(0x334455);
+    });
+  }
+
+  // ── Accuracy ring ────────────────────────────────────────────────
+  function drawRing(pct) {
+    const c=document.getElementById('ring-canvas');
+    const cx=c.getContext('2d'), W=c.width, H=c.height, R=W/2-12;
+    cx.clearRect(0,0,W,H);
+    cx.beginPath(); cx.arc(W/2,H/2,R,0,Math.PI*2);
+    cx.strokeStyle='rgba(0,100,180,0.25)'; cx.lineWidth=8; cx.stroke();
+    const s=-Math.PI/2, e=s+(pct/100)*Math.PI*2;
+    const g=cx.createLinearGradient(0,0,W,H);
+    g.addColorStop(0,'#00d4ff'); g.addColorStop(1,'#4ade80');
+    cx.beginPath(); cx.arc(W/2,H/2,R,s,e);
+    cx.strokeStyle=g; cx.lineWidth=8; cx.lineCap='round'; cx.stroke();
+    cx.beginPath(); cx.arc(W/2,H/2,R,s,e);
+    cx.strokeStyle='rgba(0,212,255,0.18)'; cx.lineWidth=18; cx.stroke();
+    document.getElementById('acc-num').textContent=pct.toFixed(1)+'%';
+  }
+
+  // ── Mini chart ───────────────────────────────────────────────────
+  function drawMiniChart(simData, cur) {
+    const mc=document.getElementById('mini-chart');
+    mc.width=mc.parentElement.clientWidth-24;
+    const ctx=mc.getContext('2d'), W=mc.width, H=mc.height;
+    ctx.clearRect(0,0,W,H);
+    const n=simData.length, bW=W/n-1;
+    simData.forEach((r,i)=>{
+      const x=i*(bW+1);
+      ctx.fillStyle=r.correct?(i===cur?'#22ff88':'#4ade8066'):(i===cur?'#ff4455':'#f8717166');
+      ctx.fillRect(x,0,bW,H);
+      if(i===cur){ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.strokeRect(x,0,bW,H);}
+    });
+    ctx.beginPath();
+    simData.forEach((r,i)=>{
+      const acc=simData.slice(0,i+1).filter(d=>d.correct).length/(i+1);
+      const x=i*(bW+1)+bW/2, y=H-acc*H;
+      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    });
+    ctx.strokeStyle='#00d4ff'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+
+  // ── Node rows ────────────────────────────────────────────────────
+  function buildNodeRows(fcmIdx) {
+    const c=document.getElementById('node-rows'); c.innerHTML='';
+    FCMS[fcmIdx].nodes.forEach(nd=>{
+      const row=document.createElement('div'); row.className='node-row';
+      row.innerHTML=`<span class="node-dot" style="background:${nd.color}"></span>
+        <span class="node-name">${nd.label}</span>
+        <div class="node-bar-wrap"><div class="node-bar" id="bar-${nd.id}" style="background:${nd.color};width:50%"></div></div>
+        <span class="node-val" id="nval-${nd.id}">0.000</span>`;
+      c.appendChild(row);
+    });
+  }
+
+  function updateNodeRows(simRow) {
+    if(!simRow) return;
+    Object.entries(simRow.nodeValues).forEach(([nid,v])=>{
+      const bar=document.getElementById('bar-'+nid);
+      const val=document.getElementById('nval-'+nid);
+      if(!bar||!val) return;
+      bar.style.width=((v+1)/2*100).toFixed(0)+'%';
+      bar.style.background=v>=0?'#4ade80':'#f87171';
+      val.textContent=v.toFixed(3); val.style.color=v>=0?'#4ade80':'#f87171';
+    });
+  }
+
+  function updateDayCard(simRow) {
+    if(!simRow) return;
+    document.getElementById('dc-date').textContent=simRow.date;
+    const pd=document.getElementById('dc-pred');
+    pd.textContent=simRow.predictedDir; pd.className='dc-val '+(simRow.predictedDir==='UP'?'up':'down');
+    const ad=document.getElementById('dc-actual');
+    const sign=simRow.actualPct>=0?'+':'';
+    ad.textContent=simRow.actualDir+' ('+sign+simRow.actualPct.toFixed(2)+'%)';
+    ad.className='dc-val '+(simRow.actualDir==='UP'?'up':'down');
+    document.getElementById('dc-close').textContent='$'+simRow.nasdaqClose.toLocaleString();
+    const badge=document.getElementById('dc-badge');
+    badge.textContent=simRow.correct?'✓  CORRECT PREDICTION':'✗  INCORRECT PREDICTION';
+    badge.className='correct-badge '+(simRow.correct?'ok':'bad');
+  }
+
+  function renderDay(d) {
+    dayIdx=d;
+    const sim=SIMDATA[activeFCM], simRow=sim.results[d];
+    document.getElementById('day-slider').value=d;
+    document.getElementById('fi-day').textContent=d+1;
+    updateDayCard(simRow);
+    updateNodeRows(simRow);
+    updateNodeVisuals(simRow);
+    const subset=sim.results.slice(0,d+1);
+    drawRing(subset.filter(r=>r.correct).length/subset.length*100);
+    drawMiniChart(sim.results,d);
+    let streak=0;
+    for(let i=d;i>=0;i--){if(sim.results[i].correct===simRow.correct)streak++;else break;}
+    document.getElementById('streak').textContent=(simRow.correct?'✓':'✗')+' Streak: '+streak;
+  }
+
+  function switchFCM(idx) {
+    activeFCM=idx; dayIdx=0;
+    document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',i===idx));
+    buildGraph(idx); buildNodeRows(idx);
+    const sim=SIMDATA[idx];
+    const slider=document.getElementById('day-slider');
+    slider.max=sim.results.length-1; slider.value=0;
+    document.getElementById('fi-total').textContent=sim.results.length;
+    renderDay(0);
+  }
+
+  // ── Controls ─────────────────────────────────────────────────────
+  document.getElementById('day-slider').addEventListener('input',e=>renderDay(parseInt(e.target.value)));
+  document.getElementById('btn-prev').addEventListener('click',()=>{if(dayIdx>0)renderDay(dayIdx-1);});
+  document.getElementById('btn-next').addEventListener('click',()=>{
+    if(dayIdx<SIMDATA[activeFCM].results.length-1)renderDay(dayIdx+1);
+  });
+  document.getElementById('btn-play').addEventListener('click',()=>{
+    playing=!playing;
+    document.getElementById('btn-play').textContent=playing?'⏸  PAUSE':'▶  PLAY';
+    if(playing) autoPlay();
+  });
+  function autoPlay(){
+    if(!playing)return;
+    const max=SIMDATA[activeFCM].results.length-1;
+    if(dayIdx>=max){playing=false;document.getElementById('btn-play').textContent='▶  PLAY';return;}
+    renderDay(dayIdx+1);
+    setTimeout(autoPlay,900);
+  }
+  document.querySelectorAll('.tab').forEach((t,i)=>{
+    t.addEventListener('click',()=>{playing=false;document.getElementById('btn-play').textContent='▶  PLAY';switchFCM(i);});
+  });
+
+  // ── Resize ───────────────────────────────────────────────────────
+  function onResize(){
+    const W=wrap.clientWidth, H=wrap.clientHeight;
+    renderer.setSize(W,H); camera.aspect=W/H; camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize',onResize); onResize();
+
+  // ── Render loop ──────────────────────────────────────────────────
+  let t=0;
+  (function animate(){
+    requestAnimationFrame(animate); t+=0.01;
+    Object.values(nodeObjects).forEach(obj=>{
+      obj.ring.lookAt(camera.position);
+      obj.mesh.material.emissiveIntensity=obj.mesh.material.emissiveIntensity*.98+(0.3+Math.sin(t*1.2)*.1)*.02;
+    });
+    if(!isDragging){spherical.theta+=0.0008;applyCamera();}
+    renderer.render(scene,camera);
+  })();
+
+  // ── Init ─────────────────────────────────────────────────────────
+  document.getElementById('date-range-badge').textContent=
+    META.startDate+' → '+META.endDate+'  |  '+META.simDays+' sim days  |  '+META.fetchedAt;
+  switchFCM(0);
+}
+</script>
+</body>
+</html>
