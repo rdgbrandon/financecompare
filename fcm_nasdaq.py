@@ -1,10 +1,28 @@
 import os
 import sys
+
+# Load .env file so API keys are available via os.getenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import time
 import math
 import json
 import copy
 import logging
+import warnings
+import re
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+
+# Suppress TF / protobuf noise before tensorflow is imported
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+warnings.filterwarnings("ignore", category=UserWarning, module="google.protobuf")
+warnings.filterwarnings("ignore", message=".*tf.reset_default_graph.*")
+warnings.filterwarnings("ignore", message=".*Do not pass an.*input_shape.*")
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from io import StringIO
@@ -28,7 +46,7 @@ try:
     import tensorflow as tf
     from tensorflow import keras
     from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout, Input
     from tensorflow.keras.optimizers import Adam
     KERAS_AVAILABLE = True
 except ImportError:
@@ -50,65 +68,37 @@ FRED_API_KEY = os.getenv("FRED_API_KEY", None)
 HAS_FRED = bool(FRED_API_KEY)
 
 def fetch_unemployment_data_fred(start_date, end_date):
-    """
-    Fetch unemployment rate data from FRED (Federal Reserve Economic Data).
-    Series: UNRATE (monthly) or similar
-    Returns: pandas Series indexed by date with unemployment rate
-    """
-    if not HAS_FRED:
-        logger.warning("FRED_API_KEY not found in environment; unemployment will be constant 0.5")
-        idx = pd.date_range(start=start_date, end=end_date, freq='B')
-        return pd.Series(0.5, index=idx)
-
+    """Fetch unemployment from FRED, VIX proxy, or dynamic fallback."""
+    idx = pd.date_range(start=start_date, end=end_date, freq='B')
+    
+    if HAS_FRED:
+        try:
+            url = 'https://api.stlouisfed.org/fred/series/data'
+            r = requests.get(url, params={'series_id': 'UNRATE', 'api_key': FRED_API_KEY, 'file_type': 'json'}, timeout=10)
+            if r.status_code == 200:
+                data_dict = {}
+                for obs in r.json().get('observations', []):
+                    try:
+                        if obs.get('value') and obs.get('value') != '.':
+                            data_dict[pd.to_datetime(obs['date'])] = float(obs['value']) / 100.0
+                    except: pass
+                if data_dict:
+                    s = pd.Series(data_dict).sort_index().clip(0, 1)
+                    logger.info(f'Fetched unemployment from FRED: {len(data_dict)} observations')
+                    return s.reindex(idx).ffill().fillna(0.5)
+        except: pass
+    
     try:
-        # Use FRED API to fetch unemployment rate (UNRATE)
-        url = "https://api.stlouisfed.org/fred/series/data"
-        params = {
-            "series_id": "UNRATE",
-            "api_key": FRED_API_KEY,
-            "file_type": "json"
-        }
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            logger.warning("FRED API returned %d; using constant unemployment", r.status_code)
-            idx = pd.date_range(start=start_date, end=end_date, freq='B')
-            return pd.Series(0.5, index=idx)
-
-        payload = r.json()
-        obs = payload.get("observations", [])
-
-        unemployment_dict = {}
-        for o in obs:
-            date_str = o.get("date")
-            value = o.get("value")
-            if date_str and value and value != ".":
-                try:
-                    date = pd.to_datetime(date_str)
-                    unemployment_dict[date] = float(value)
-                except:
-                    continue
-
-        if not unemployment_dict:
-            logger.warning("No unemployment data from FRED; using constant 0.5")
-            idx = pd.date_range(start=start_date, end=end_date, freq='B')
-            return pd.Series(0.5, index=idx)
-
-        # Create series and ffill for daily data
-        unemployment_series = pd.Series(unemployment_dict).sort_index()
-        unemployment_series = unemployment_series / 100.0  # normalize to [0, 1] range
-        unemployment_series = unemployment_series.clip(0, 1)
-
-        # Reindex to daily and forward fill
-        idx = pd.date_range(start=start_date, end=end_date, freq='B')
-        unemployment_series = unemployment_series.reindex(idx, method='ffill')
-
-        logger.info(f"Fetched unemployment data from FRED: {len(unemployment_dict)} observations")
-        return unemployment_series
-
-    except Exception as e:
-        logger.exception(f"FRED fetch error: {e}; using constant unemployment")
-        idx = pd.date_range(start=start_date, end=end_date, freq='B')
-        return pd.Series(0.5, index=idx)
+        logger.info('Fetching unemployment via VIX volatility proxy...')
+        vix_data = yf.download('^VIX', start=start_date, end=end_date, progress=False, auto_adjust=True)
+        vix = vix_data['Close'] if isinstance(vix_data, pd.DataFrame) and 'Close' in vix_data.columns else (vix_data.iloc[:, 0] if isinstance(vix_data, pd.DataFrame) else vix_data)
+        unemployment = 0.5 + 0.25 * (vix.clip(10, 80) - 45) / 35.0
+        logger.info(f'Using VIX proxy for unemployment: {len(unemployment)} days')
+        return unemployment.clip(0.2, 0.8).reindex(idx).ffill().fillna(0.5)
+    except: pass
+    
+    logger.info('Using dynamic fallback unemployment estimate')
+    return pd.Series(0.5 + 0.1 * np.sin(2 * np.pi * idx.dayofyear.astype(float) / 365.0), index=idx).clip(0.3, 0.7)
 
 # -----------------------
 # Configuration (editable)
@@ -163,70 +153,77 @@ def get_date_range(start_date=None, end_date=None, years_back=5, extra_days=100)
 # -----------------------
 def load_loughran_lexicon(try_urls=None):
     """
-    Attempt to download a Loughran–McDonald style lexicon.
-    Return two sets: positive_words, negative_words.
-    Falls back to CONFIG fallback lists if download fails.
+    Attempt to download a Loughran-McDonald style lexicon.
+    Returns two sets: positive_words, negative_words.
+    Falls back immediately to the embedded fallback wordlist if the network
+    request fails, times out, or returns HTML instead of CSV (e.g. Google
+    Drive confirmation pages).
     """
+    fallback_pos = set(CONFIG["fallback_positive"])
+    fallback_neg = set(CONFIG["fallback_negative"])
+
     if try_urls is None:
         try_urls = CONFIG["lexicon_urls"]
+
     for url in try_urls:
         try:
             logger.info(f"Attempting to download lexicon from {url}")
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                text = r.text
-                # Attempt to parse CSV; we only need the word column and positive/negative columns if present
-                csvf = StringIO(text)
-                df = pd.read_csv(csvf, dtype=str, keep_default_na=False, na_values=[])
-                # heuristics: find column that looks like "Word" or first column;
-                word_col = None
-                pos_col = None
-                neg_col = None
-                for c in df.columns:
-                    lc = c.strip().lower()
-                    if "word" in lc or "token" in lc or "term" in lc:
-                        word_col = c
-                    if "positive" in lc or "pos" == lc:
-                        pos_col = c
-                    if "negative" in lc or "neg" == lc:
-                        neg_col = c
-                if word_col is None:
-                    word_col = df.columns[0]
-                positive = set()
-                negative = set()
-                for _, row in df.iterrows():
-                    w = str(row[word_col]).strip().lower()
-                    if not w:
-                        continue
-                    # If pos/neg columns exist interpret them, otherwise use simple heuristics
-                    try:
-                        if pos_col and int(float(row[pos_col])) > 0:
-                            positive.add(w)
-                        if neg_col and int(float(row[neg_col])) > 0:
-                            negative.add(w)
-                    except Exception:
-                        pass
-                if len(positive) == 0 and len(negative) == 0:
-                    # fallback: try to parse lists in raw text
-                    lines = text.splitlines()
-                    for L in lines:
-                        parts = L.strip().split()
-                        if len(parts) == 1 and parts[0].isalpha():
-                            # crude
-                            pass
-                logger.info(f"Loaded lexicon from {url}: +{len(positive)} / -{len(negative)}")
-                if len(positive) == 0:
-                    positive = set(CONFIG["fallback_positive"])
-                if len(negative) == 0:
-                    negative = set(CONFIG["fallback_negative"])
-                return positive, negative
-            else:
-                logger.warning(f"Lexicon download returned {r.status_code}: {r.text[:200]}")
+            r = requests.get(url, timeout=5)  # short timeout — don't block startup
+            if r.status_code != 200:
+                logger.warning(f"Lexicon download returned {r.status_code}; using fallback")
+                break
+
+            text = r.text.strip()
+            # Google Drive "confirm download" page is HTML, not CSV
+            if text.lstrip().startswith("<"):
+                logger.warning("Lexicon URL returned HTML (likely a Google Drive interstitial); using fallback")
+                break
+
+            csvf = StringIO(text)
+            df = pd.read_csv(csvf, dtype=str, keep_default_na=False, na_values=[])
+
+            word_col = pos_col = neg_col = None
+            for c in df.columns:
+                lc = c.strip().lower()
+                if word_col is None and ("word" in lc or "token" in lc or "term" in lc):
+                    word_col = c
+                if pos_col is None and ("positive" in lc or lc == "pos"):
+                    pos_col = c
+                if neg_col is None and ("negative" in lc or lc == "neg"):
+                    neg_col = c
+            if word_col is None and len(df.columns) > 0:
+                word_col = df.columns[0]
+
+            positive, negative = set(), set()
+            for _, row in df.iterrows():
+                w = str(row[word_col]).strip().lower()
+                if not w:
+                    continue
+                try:
+                    if pos_col and int(float(row[pos_col])) > 0:
+                        positive.add(w)
+                    if neg_col and int(float(row[neg_col])) > 0:
+                        negative.add(w)
+                except Exception:
+                    pass
+
+            if not positive:
+                positive = fallback_pos
+            if not negative:
+                negative = fallback_neg
+
+            logger.info(f"Loaded lexicon: +{len(positive)} / -{len(negative)}")
+            return positive, negative
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"Lexicon download timed out for {url}; using fallback")
+            break
         except Exception as e:
-            logger.exception(f"Lexicon download failed for {url}: {e}")
-    # final fallback
-    logger.warning("Lexicon download failed for all sources; using embedded fallback.")
-    return set(CONFIG["fallback_positive"]), set(CONFIG["fallback_negative"])
+            logger.warning(f"Lexicon download failed ({e}); using fallback")
+            break
+
+    logger.info("Using embedded fallback lexicon.")
+    return fallback_pos, fallback_neg
 
 # -----------------------
 # Price fetching (yfinance primary, polygon optional)
@@ -301,7 +298,14 @@ def fetch_prices_google(tickers, start, end):
     price_dict = {}
     for t in tickers:
         d = fetch_prices_polygon(t, start, end)
-        price_dict[t] = d['Adj Close']
+        if 'Adj Close' in d.columns:
+            price_dict[t] = d['Adj Close']
+        elif 'Close' in d.columns:
+            price_dict[t] = d['Close']
+        elif t in d.columns:
+            price_dict[t] = d[t]
+        else:
+            price_dict[t] = d.iloc[:, 0]
     df = pd.DataFrame(price_dict).rename_axis('Date').sort_index()
     return df
 
@@ -315,10 +319,18 @@ def fetch_news_newsapi(query, start, end, page_size=100, max_pages=5, domains=No
     """
     Fetch news using NewsAPI historical endpoints (if available).
     Returns a list of dicts with keys: title, description, publishedAt, url, source.
+    NewsAPI free/developer plans only allow articles from the last 30 days; cap start accordingly.
     """
     if not HAS_NEWSAPI:
         logger.debug("NewsAPI key not found; skipping NewsAPI fetch for query=%s", query)
         return []
+    _limit_start = (datetime.now(timezone.utc) - timedelta(days=28)).strftime("%Y-%m-%d")
+    try:
+        if start < _limit_start:
+            logger.debug("NewsAPI: capping start from %s to %s (plan limit)", start, _limit_start)
+            start = _limit_start
+    except Exception:
+        start = _limit_start
     results = []
     base = "https://newsapi.org/v2/everything"
     headers = {"Authorization": NEWSAPI_KEY}
@@ -397,9 +409,153 @@ def fetch_news_polygon_bulk(tickers_or_query_list, start, end, per_ticker_limit=
         return []
 
 # -----------------------
+# Google News RSS fetcher  (real separate source — no API key needed)
+# -----------------------
+def fetch_google_news_rss(query: str, limit: int = 50, timeout: int = 8) -> list:
+    """
+    Fetch articles from Google News RSS feed.
+    This is a genuinely different source from Yahoo Finance / NewsAPI.
+    Parses with stdlib xml.etree — no extra dependencies.
+    query: can be a ticker symbol or free-text topic (e.g. "AAPL stock market")
+    Returns list of dicts with same schema as fetch_news_newsapi.
+    """
+    clean_q = query.replace("^","").replace("=F","").replace("-USD","")
+    url = (
+        f"https://news.google.com/rss/search"
+        f"?q={clean_q}+stock+market&hl=en-US&gl=US&ceid=US:en"
+    )
+    try:
+        r = requests.get(url, timeout=timeout,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; research/1.0)"})
+        if r.status_code != 200:
+            logger.warning("Google News RSS returned %d for query=%s", r.status_code, query)
+            return []
+        root = ET.fromstring(r.content)
+        channel = root.find("channel")
+        if channel is None:
+            return []
+        articles = []
+        for item in channel.findall("item")[:limit]:
+            title   = item.findtext("title",       "") or ""
+            link    = item.findtext("link",        "") or ""
+            desc    = item.findtext("description", "") or ""
+            pub_str = item.findtext("pubDate",     "") or ""
+
+            # Google News puts "Title - Source" in the title element
+            source = "Google News"
+            if " - " in title:
+                parts  = title.rsplit(" - ", 1)
+                title  = parts[0].strip()
+                source = parts[1].strip()
+
+            # Parse publish date to ISO string
+            published_at = pub_str
+            pub_ts = int(time.time())
+            if pub_str:
+                try:
+                    pub_ts = int(parsedate_to_datetime(pub_str).timestamp())
+                    published_at = parsedate_to_datetime(pub_str).isoformat()
+                except Exception:
+                    pass
+
+            articles.append({
+                "title":       title,
+                "description": desc[:400],
+                "publishedAt": published_at,
+                "url":         link,
+                "source":      source,
+                "providerPublishTime": pub_ts,
+            })
+        logger.info("Google News RSS: %d articles for query=%s", len(articles), query)
+        return articles
+    except Exception as e:
+        logger.warning("Google News RSS error for query=%s: %s", query, e)
+        return []
+
+# -----------------------
+# Google Finance current-quote scraper  (no API key needed)
+# -----------------------
+
+# Maps yfinance ticker symbols → Google Finance (symbol, exchange) pairs
+_GF_EXCHANGE: dict = {
+    "AAPL":"NASDAQ","MSFT":"NASDAQ","NVDA":"NASDAQ","GOOG":"NASDAQ",
+    "GOOGL":"NASDAQ","AMZN":"NASDAQ","TSLA":"NASDAQ","META":"NASDAQ",
+    "NFLX":"NASDAQ","ORCL":"NYSE","JPM":"NYSE","GS":"NYSE","BAC":"NYSE",
+    "XOM":"NYSE","CVX":"NYSE","WMT":"NYSE","V":"NYSE","MA":"NYSE",
+    "SPY":"NYSEARCA","QQQ":"NASDAQ","GLD":"NYSEARCA",
+}
+
+def scrape_google_finance_quote(ticker: str, timeout: int = 8) -> dict:
+    """
+    Scrape a real-time quote from Google Finance.
+    Uses three extraction strategies in order of reliability:
+      1. data-last-price HTML attribute
+      2. JSON-LD structured-data <script> block
+      3. Known CSS class selectors (fragile, last resort)
+    Returns dict with keys: price, change_pct, source, url, timestamp.
+    Returns empty dict on any failure — always fail gracefully.
+    """
+    clean = ticker.replace("^", "").replace("=F", "").replace("-USD", "")
+    exchange = _GF_EXCHANGE.get(ticker, _GF_EXCHANGE.get(clean, "NASDAQ"))
+    url = f"https://www.google.com/finance/quote/{clean}:{exchange}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    meta = {"source": "Google Finance", "url": url,
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            logger.debug("Google Finance: HTTP %d for %s", r.status_code, ticker)
+            return {}
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Strategy 1: data-last-price attribute (most reliable when present)
+        elem = soup.find(attrs={"data-last-price": True})
+        if elem:
+            price = float(elem["data-last-price"])
+            chg_e = soup.find(attrs={"data-last-normal-market-change-percent": True})
+            chg   = (float(chg_e["data-last-normal-market-change-percent"]) * 100
+                     if chg_e else 0.0)
+            return {**meta, "price": price, "change_pct": chg}
+
+        # Strategy 2: JSON-LD structured data
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                d = json.loads(script.string or "{}")
+                if isinstance(d, dict) and "price" in d:
+                    return {**meta, "price": float(d["price"]), "change_pct": 0.0}
+            except Exception:
+                pass
+
+        # Strategy 3: CSS class selectors (brittle — class names change with Google deploys)
+        for cls in ["YMlKec fxKbKc", "kf1m4", "AHmHk", "IsqQVc NprOob YMlKec"]:
+            elem = soup.find(class_=cls)
+            if elem:
+                raw = elem.get_text(strip=True).replace("$","").replace(",","")
+                try:
+                    price = float(raw)
+                    if price > 0:
+                        return {**meta, "price": price, "change_pct": 0.0}
+                except ValueError:
+                    pass
+
+        logger.debug("Google Finance: no price found for %s", ticker)
+        return {}
+    except Exception as e:
+        logger.debug("Google Finance scrape error for %s: %s", ticker, e)
+        return {}
+
+# -----------------------
 # Text cleaning & sentiment
 # -----------------------
-import re
 _token_re = re.compile(r"[^\w\s!]")
 _excl_re = re.compile(r"!+")
 
@@ -518,7 +674,7 @@ def build_proxies_from_prices(price_df, node_ticker_map, target_index, start_dat
 
     # Fetch unemployment data if available
     unemployment_data = None
-    if start_date and end_date and HAS_FRED:
+    if start_date and end_date:
         unemployment_data = fetch_unemployment_data_fred(start_date, end_date)
 
     for node, tickers in node_ticker_map.items():
@@ -526,7 +682,7 @@ def build_proxies_from_prices(price_df, node_ticker_map, target_index, start_dat
             # no proxy available
             if node == "Low_Unemployment" and unemployment_data is not None:
                 # Use FRED unemployment data
-                inputs[node] = unemployment_data.reindex(price_df.index).fillna(method='ffill').fillna(0.5)
+                inputs[node] = unemployment_data.reindex(price_df.index).ffill().fillna(0.5)
                 logger.info(f"Using FRED unemployment data for {node}")
             else:
                 # Fall back to constant
@@ -564,7 +720,12 @@ def build_proxies_from_prices(price_df, node_ticker_map, target_index, start_dat
             else:
                 inputs[node] = pd.Series(0.0, index=price_df.index)
     # News_Sentiment will be added externally as columns per source
-    inputs_df = pd.DataFrame(inputs).reindex(price_df.index)
+    # Squeeze any 2-D arrays/DataFrames down to 1-D Series before constructing the DataFrame
+    inputs_clean = {
+        k: (v.squeeze() if hasattr(v, "squeeze") and getattr(v, "ndim", 1) > 1 else v)
+        for k, v in inputs.items()
+    }
+    inputs_df = pd.DataFrame(inputs_clean).reindex(price_df.index)
     target = None
     if target_index in returns.columns:
         target = returns[target_index]
@@ -694,7 +855,8 @@ def build_lstm_model(input_shape, output_shape=1, lstm_units=64, dropout=0.2):
         return None
 
     model = Sequential([
-        LSTM(lstm_units, activation='relu', input_shape=input_shape, return_sequences=True),
+        Input(shape=input_shape),
+        LSTM(lstm_units, activation='relu', return_sequences=True),
         Dropout(dropout),
         LSTM(lstm_units // 2, activation='relu'),
         Dropout(dropout),
@@ -765,10 +927,9 @@ def build_gru_model(input_shape, output_shape=1, gru_units=64, dropout=0.2):
         logger.warning("TensorFlow/Keras not available; GRU model skipped")
         return None
 
-    from tensorflow.keras.layers import GRU
-
     model = Sequential([
-        GRU(gru_units, activation='relu', input_shape=input_shape, return_sequences=True),
+        Input(shape=input_shape),
+        GRU(gru_units, activation='relu', return_sequences=True),
         Dropout(dropout),
         GRU(gru_units // 2, activation='relu'),
         Dropout(dropout),
@@ -847,6 +1008,12 @@ def compute_node_correlations(inputs_df, target_series, window=252):
         if len(data_slice) < 10:  # Need minimum data
             continue
 
+        # Drop zero-variance columns to avoid numpy divide-by-zero in corrwith
+        varying_cols = data_slice.columns[data_slice.std() > 1e-10]
+        data_slice = data_slice[varying_cols]
+        if data_slice.empty:
+            continue
+
         # Compute correlations
         correlations = data_slice.corrwith(target_slice)
         correlations_history[snapshot_date] = correlations
@@ -913,60 +1080,95 @@ def prepare_data_and_run(config_override=None):
     inputs_df_google, target_google = build_proxies_from_prices(price_df_google, conf["node_ticker_map"], conf["target_ticker"], start_date=start, end_date=end)
     # load lexicon
     pos_set, neg_set = load_loughran_lexicon()
-    # fetch news: try source-specific with NewsAPI if available, else Polygon unified
-    polarity_series_yahoo = None
-    polarity_series_google = None
-    polarity_series = None
-    intensity_series = None
-    articles = []
-    if HAS_NEWSAPI:
-        q = conf["news_query"]
-        # Try fetching without domain restrictions first (more reliable)
-        articles_all = fetch_news_newsapi(q, start, end)
-        if articles_all:
-            # Simulate split between yahoo and google for dual analysis
-            mid = len(articles_all) // 2
-            articles_yahoo = articles_all[:mid]
-            articles_google = articles_all[mid:]
-        else:
-            articles_yahoo = []
-            articles_google = []
-        polarity_series_yahoo, _ = aggregate_daily_sentiment(articles_yahoo, pos_set, neg_set, conf["sentiment_shift_days"])
-        polarity_series_google, _ = aggregate_daily_sentiment(articles_google, pos_set, neg_set, conf["sentiment_shift_days"])
-        # If both are empty, fall through to create unified sentiment
-        if polarity_series_yahoo.empty and polarity_series_google.empty:
-            polarity_series_yahoo = None
-            polarity_series_google = None
 
-    if polarity_series_yahoo is None or polarity_series_yahoo.empty:
-        # fallback: fetch without domain filter or use Polygon
-        articles = []
-        if HAS_NEWSAPI:
-            q = conf["news_query"]
-            articles = fetch_news_newsapi(q, start, end)  # No domain restriction
-        if not articles and POLYGON_AVAILABLE:
-            tickers_for_news = list(set([x for sub in conf["node_ticker_map"].values() for x in sub]))
-            articles = fetch_news_polygon_bulk(tickers_for_news, start, end)
-        polarity_series, intensity_series = aggregate_daily_sentiment(articles, pos_set, neg_set, conf["sentiment_shift_days"])
-        # Create synthetic sentiment if no real data available
-        if polarity_series.empty:
-            logger.warning("No news articles found; creating synthetic sentiment based on price volatility")
-            # Use returns volatility as sentiment proxy
-            volatility = target_yahoo.rolling(window=20).std().fillna(0)
-            # Normalize to [-1, 1] using tanh
-            polarity_series = pd.Series(
-                np.tanh((volatility - volatility.mean()) / (volatility.std() + 1e-8)),
-                index=target_yahoo.index
-            )
-    # attach sentiment into inputs
-    if polarity_series_yahoo is not None:
-        inputs_df_yahoo["News_Sentiment_Yahoo"] = polarity_series_yahoo.reindex(inputs_df_yahoo.index).fillna(0.0)
-        inputs_df_google["News_Sentiment_Yahoo"] = polarity_series_yahoo.reindex(inputs_df_google.index).fillna(0.0)
-        inputs_df_yahoo["News_Sentiment_Google"] = polarity_series_google.reindex(inputs_df_yahoo.index).fillna(0.0)
-        inputs_df_google["News_Sentiment_Google"] = polarity_series_google.reindex(inputs_df_google.index).fillna(0.0)
-    else:
-        inputs_df_yahoo["News_Sentiment"] = polarity_series.reindex(inputs_df_yahoo.index).fillna(0.0)
-        inputs_df_google["News_Sentiment"] = polarity_series.reindex(inputs_df_google.index).fillna(0.0)
+    # ── Yahoo sentiment: NewsAPI (historical) → Polygon → yfinance news → synthetic ──
+    logger.info("Fetching Yahoo/NewsAPI sentiment data…")
+    articles_yahoo = []
+    if HAS_NEWSAPI:
+        articles_yahoo = fetch_news_newsapi(conf["news_query"], start, end)
+    if not articles_yahoo and POLYGON_AVAILABLE:
+        tickers_for_news = list({x for sub in conf["node_ticker_map"].values() for x in sub})
+        articles_yahoo = fetch_news_polygon_bulk(tickers_for_news, start, end)
+
+    polarity_series_yahoo, intensity_series_yahoo = aggregate_daily_sentiment(
+        articles_yahoo, pos_set, neg_set, conf["sentiment_shift_days"]
+    )
+
+    # Synthetic Yahoo fallback: price-volatility proxy when no news found
+    if polarity_series_yahoo.empty:
+        logger.warning("No Yahoo/NewsAPI articles; using price-volatility proxy for Yahoo sentiment")
+        vol_y = target_yahoo.rolling(window=20).std().fillna(0)
+        polarity_series_yahoo = pd.Series(
+            np.tanh((vol_y - vol_y.mean()) / (vol_y.std() + 1e-8)),
+            index=target_yahoo.index,
+        )
+        intensity_series_yahoo = pd.Series(vol_y.values, index=target_yahoo.index)
+
+    # ── Google sentiment: Google News RSS (real separate source) → synthetic ──
+    logger.info("Fetching Google News RSS sentiment data…")
+    # Use a broader market query so we get decent coverage even for recent news
+    google_rss_query = conf.get("news_query", "NASDAQ OR stock market OR technology OR AI")
+    articles_google = fetch_google_news_rss(google_rss_query, limit=200)
+
+    polarity_series_google, intensity_series_google = aggregate_daily_sentiment(
+        articles_google, pos_set, neg_set, conf["sentiment_shift_days"]
+    )
+
+    # Synthetic Google fallback: momentum-based proxy when RSS returns nothing
+    if polarity_series_google.empty:
+        logger.warning("No Google News RSS articles; using momentum proxy for Google sentiment")
+        # Use 5-day vs 20-day return momentum as a sign-preserving proxy
+        ret_5   = target_yahoo.rolling(5).mean().fillna(0)
+        ret_20  = target_yahoo.rolling(20).mean().fillna(0)
+        momentum = ret_5 - ret_20
+        polarity_series_google = pd.Series(
+            np.tanh(momentum * 50),
+            index=target_yahoo.index,
+        )
+        intensity_series_google = pd.Series(momentum.abs().values, index=target_yahoo.index)
+
+    # Keep references for return dict
+    polarity_series  = polarity_series_yahoo    # backward compat
+    intensity_series = intensity_series_yahoo
+
+    # ── Attach both sentiment streams as separate FCM input nodes ────────────
+    inputs_df_yahoo["News_Sentiment_Yahoo"]  = (
+        polarity_series_yahoo.reindex(inputs_df_yahoo.index).fillna(0.0)
+    )
+    inputs_df_yahoo["News_Sentiment_Google"] = (
+        polarity_series_google.reindex(inputs_df_yahoo.index).fillna(0.0)
+    )
+    inputs_df_google["News_Sentiment_Yahoo"]  = (
+        polarity_series_yahoo.reindex(inputs_df_google.index).fillna(0.0)
+    )
+    inputs_df_google["News_Sentiment_Google"] = (
+        polarity_series_google.reindex(inputs_df_google.index).fillna(0.0)
+    )
+
+    # ── Sentiment Divergence: (Yahoo − Google) → cross-source agreement signal ─
+    # High divergence = sources disagree = heightened uncertainty
+    # Low divergence  = sources agree    = higher confidence signal
+    sentiment_divergence_yahoo = (
+        polarity_series_yahoo.reindex(inputs_df_yahoo.index).fillna(0.0)
+        - polarity_series_google.reindex(inputs_df_yahoo.index).fillna(0.0)
+    )
+    inputs_df_yahoo["Sentiment_Divergence"]  = sentiment_divergence_yahoo
+    inputs_df_google["Sentiment_Divergence"] = sentiment_divergence_yahoo  # same divergence
+
+    # ── Sentiment Agreement Score: 1 when both sources agree, 0 when they diverge ─
+    # Used as a confidence multiplier in signal generation
+    max_div = sentiment_divergence_yahoo.abs().rolling(20, min_periods=1).max().replace(0, 1e-8)
+    agreement_score = 1.0 - (sentiment_divergence_yahoo.abs() / max_div).clip(0, 1)
+    inputs_df_yahoo["Sentiment_Agreement"]  = agreement_score
+    inputs_df_google["Sentiment_Agreement"] = agreement_score
+
+    logger.info(
+        "Sentiment sources — Yahoo articles: %d | Google RSS articles: %d",
+        len(articles_yahoo), len(articles_google),
+    )
+    # backward-compat aliases for old callers that checked polarity_series_yahoo
+    polarity_series_yahoo_out  = polarity_series_yahoo
+    polarity_series_google_out = polarity_series_google
     # node order: outer followed by inner
     node_order = list(inputs_df_yahoo.columns) + ['Monetary_Policy','Inflation','Corporate_Earnings','Investor_Sentiment','NASDAQ']
     # estimate initial weights from correlations (use yahoo for estimation)
@@ -1111,8 +1313,9 @@ def prepare_data_and_run(config_override=None):
     logger.info("Computing historical node correlations...")
     correlations_history_yahoo = compute_node_correlations(inputs_norm_yahoo, actual_norm, window=252)
 
-    # Compute feature importance (correlation with target at end)
-    feature_importance = inputs_norm_yahoo.corrwith(actual_norm).abs().sort_values(ascending=False)
+    # Compute feature importance (correlation with target at end) — skip constant columns
+    _fi_cols = inputs_norm_yahoo.columns[inputs_norm_yahoo.std() > 1e-10]
+    feature_importance = inputs_norm_yahoo[_fi_cols].corrwith(actual_norm).abs().sort_values(ascending=False)
 
     # return
     return {
@@ -1155,6 +1358,8 @@ def prepare_data_and_run(config_override=None):
         # Node Correlations
         "correlations_history_yahoo": correlations_history_yahoo,
         "feature_importance": feature_importance,
+        "dyn_norm_yahoo": dyn_norm_yahoo,
+        "dyn_norm_google": dyn_norm_google,
     }
 
 # If run as script, run default pipeline and write minimal output

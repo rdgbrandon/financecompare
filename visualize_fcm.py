@@ -10,6 +10,12 @@ from datetime import datetime
 import networkx as nx
 import copy
 import logging
+try:
+    from scipy import stats as _scipy_stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    _scipy_stats = None
+    SCIPY_AVAILABLE = False
 
 # Import the core pipeline
 from fcm_nasdaq import prepare_data_and_run, compute_state_from_outer
@@ -114,7 +120,7 @@ def build_node_positions(out):
         'pos_to_name': pos_to_name,
         'node_order': node_order
     }
-
+M
 # ============================================================================
 # ANIMATED FCM STRUCTURE VISUALIZATION - PRIMARY VISUAL
 # ============================================================================
@@ -732,23 +738,20 @@ def plot_weight_evolution(out):
         positive_mask = np.array(weights_arr) >= 0
         negative_mask = ~positive_mask
         
-        ax.fill_between(range(len(dates)), 0, weights_arr, where=positive_mask,
+        ax.fill_between(list(dates), 0, weights_arr, where=positive_mask,
                        alpha=0.2, color=colors["actual"], label='Positive')
-        ax.fill_between(range(len(dates)), 0, weights_arr, where=negative_mask,
+        ax.fill_between(list(dates), 0, weights_arr, where=negative_mask,
                        alpha=0.2, color=colors["prediction"], label='Negative')
-        
+
         title_text = f"Weight Evolution: {src} → {tgt}"
         if src == 'Low_Unemployment':
             title_text += " (FRED DATA)"
-        
+
         ax.set_ylabel("FCM Weight", fontsize=fonts["label"], fontweight='bold')
         ax.set_title(title_text, fontsize=fonts["subtitle"], fontweight='bold')
         ax.grid(True, alpha=0.2)
         ax.tick_params(axis='x', rotation=45)
-        ax.set_ylim(-1.1, 1.1)  # Weights are clipped to [-1, 1]
-        ax.set_xticks(range(0, len(dates), max(1, len(dates)//5)))
-        ax.set_xticklabels([dates[i].strftime('%Y-%m-%d') if hasattr(dates[i], 'strftime') else str(dates[i]) 
-                           for i in range(0, len(dates), max(1, len(dates)//5))], rotation=45, ha='right')
+        ax.set_ylim(-1.1, 1.1)
     
     fig.suptitle("FCM Weight Evolution Over Time (from Real Learning)",
                 fontsize=fonts["title"], fontweight='bold', y=0.995)
@@ -904,9 +907,8 @@ def plot_fcm_network_final_state(out):
     ax.set_title("FCM Network - Final State (Yahoo Source)", fontsize=fonts["title"], fontweight='bold', pad=20)
     
     # Legend
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='green', edgecolor='darkgreen', label='Positive weight'),
-                      Patch(facecolor='red', edgecolor='darkred', label='Negative weight')]
+    legend_elements = [mpatches.Patch(facecolor='green', edgecolor='darkgreen', label='Positive weight'),
+                      mpatches.Patch(facecolor='red', edgecolor='darkred', label='Negative weight')]
     ax.legend(handles=legend_elements, loc='upper left', fontsize=fonts["legend"])
     
     plt.tight_layout()
@@ -1007,8 +1009,10 @@ def plot_residual_analysis(out):
     
     # 3. Q-Q plot
     ax3 = fig.add_subplot(gs[1, 1])
-    from scipy import stats
-    stats.probplot(residuals, dist="norm", plot=ax3)
+    if SCIPY_AVAILABLE:
+        _scipy_stats.probplot(residuals, dist="norm", plot=ax3)
+    else:
+        ax3.text(0.5, 0.5, "scipy not available", ha='center', va='center', transform=ax3.transAxes)
     ax3.set_title("Q-Q Plot: Residual Normality", fontsize=fonts["subtitle"], fontweight='bold')
     ax3.grid(True, alpha=0.2)
     
